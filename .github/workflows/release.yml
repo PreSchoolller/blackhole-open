@@ -3,13 +3,18 @@ name: Release
 on:
   push:
     tags: [ 'v*' ]        # 推 v 开头的 tag 时触发
-  workflow_dispatch:       # 也允许在网页上手动触发
+  workflow_dispatch:       # 手动触发（只构建出 artifact 供下载，不发 Release）
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write      # 允许该任务创建 Release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, label: windows-x64 }
+          - { os: ubuntu-latest,  label: linux-x64 }
+          - { os: macos-15,       label: macos-arm64 }   # Intel runner（macos-13）已退役；Intel Mac 用户请改用仓库 jar + 自装 JDK
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -19,9 +24,72 @@ jobs:
           java-version: '17'
           cache: maven
 
-      - run: mvn -B -ntp package
+      - name: Build fat jar
+        run: mvn -B -ntp package
+
+      - name: Prepare jpackage input
+        shell: bash
+        run: |
+          mkdir -p target/jpkg-input
+          cp target/blackhole-lwjgl-*.jar target/jpkg-input/
+
+      - name: Detect required JDK modules (jdeps)
+        id: modules
+        shell: bash
+        run: |
+          MODULES=$(jdeps --print-module-deps --ignore-missing-deps target/jpkg-input/*.jar | tail -1)
+          echo "modules=$MODULES" >> "$GITHUB_OUTPUT"
+          echo "Required modules: $MODULES"
+
+      - name: jlink trimmed runtime
+        shell: bash
+        run: |
+          jlink --add-modules "${{ steps.modules.outputs.modules }}" \
+                --strip-debug --no-man-pages --no-header-files --compress=2 \
+                --output target/runtime-trim
+
+      - name: jpackage app-image
+        shell: bash
+        run: |
+          JAR_NAME=$(ls target/jpkg-input/*.jar | xargs -n1 basename)
+          jpackage --type app-image --name BlackHole \
+                   --input target/jpkg-input \
+                   --main-jar "$JAR_NAME" \
+                   --runtime-image target/runtime-trim \
+                   --dest target/jpkg
+
+      - name: Zip app-image (Linux)
+        if: runner.os == 'Linux'
+        run: (cd target/jpkg && zip -qr "../BlackHole-${{ matrix.label }}.zip" BlackHole)
+
+      - name: Zip app-image (macOS)
+        if: runner.os == 'macOS'
+        run: ditto -c -k --sequesterRsrc --keepParent target/jpkg/BlackHole.app "target/BlackHole-${{ matrix.label }}.zip"
+
+      - name: Zip app-image (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path target/jpkg/BlackHole -DestinationPath "target/BlackHole-${{ matrix.label }}.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BlackHole-${{ matrix.label }}
+          path: target/BlackHole-${{ matrix.label }}.zip
+
+  release:
+    if: github.ref_type == 'tag'   # 只有 tag 推送才发 Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
 
       - uses: softprops/action-gh-release@v2
         with:
-          files: target/blackhole-lwjgl-*.jar   # 只传 shaded jar，排除 original-* 中间产物
-          generate_release_notes: true          # 自动按 commit 生成 changelog
+          files: dist/*.zip
+          generate_release_notes: true
