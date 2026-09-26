@@ -77,6 +77,18 @@ jobs:
           name: BlackHole-${{ matrix.label }}
           path: target/BlackHole-${{ matrix.label }}.zip
 
+      # fat jar 与平台无关，任选一个 job 上传一次即可（Linux 最快）
+      - name: Stage universal fat jar
+        if: runner.os == 'Linux'
+        run: cp target/blackhole-lwjgl-*.jar target/BlackHole-universal.jar
+
+      - name: Upload universal jar artifact
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: BlackHole-jar
+          path: target/BlackHole-universal.jar
+
   release:
     if: github.ref_type == 'tag'   # 只有 tag 推送才发 Release
     needs: build
@@ -91,5 +103,7 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.zip
+          files: |
+            dist/*.zip
+            dist/*.jar
           generate_release_notes: true
