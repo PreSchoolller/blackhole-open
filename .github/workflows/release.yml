@@ -18,6 +18,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 资产文件名带上 ref 名（tag 推送=tag 名，手动触发=分支名）；tag 中的斜杠换成横杠，避免破坏文件路径
+      - name: Compute asset version
+        shell: bash
+        run: echo "ASSET_VER=${GITHUB_REF_NAME//\//-}" >> "$GITHUB_ENV"
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -60,34 +65,34 @@ jobs:
 
       - name: Zip app-image (Linux)
         if: runner.os == 'Linux'
-        run: (cd target/jpkg && zip -qr "../BlackHole-${{ matrix.label }}.zip" BlackHole)
+        run: (cd target/jpkg && zip -qr "../BlackHole-${ASSET_VER}-${{ matrix.label }}.zip" BlackHole)
 
       - name: Zip app-image (macOS)
         if: runner.os == 'macOS'
-        run: ditto -c -k --sequesterRsrc --keepParent target/jpkg/BlackHole.app "target/BlackHole-${{ matrix.label }}.zip"
+        run: ditto -c -k --sequesterRsrc --keepParent target/jpkg/BlackHole.app "target/BlackHole-${ASSET_VER}-${{ matrix.label }}.zip"
 
       - name: Zip app-image (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: Compress-Archive -Path target/jpkg/BlackHole -DestinationPath "target/BlackHole-${{ matrix.label }}.zip"
+        run: Compress-Archive -Path target/jpkg/BlackHole -DestinationPath "target/BlackHole-${env:ASSET_VER}-${{ matrix.label }}.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: BlackHole-${{ matrix.label }}
-          path: target/BlackHole-${{ matrix.label }}.zip
+          path: target/BlackHole-${{ env.ASSET_VER }}-${{ matrix.label }}.zip
 
       # fat jar 与平台无关，任选一个 job 上传一次即可（Linux 最快）
       - name: Stage universal fat jar
         if: runner.os == 'Linux'
-        run: cp target/blackhole-lwjgl-*.jar target/BlackHole-universal.jar
+        run: cp target/blackhole-lwjgl-*.jar "target/BlackHole-${ASSET_VER}-universal.jar"
 
       - name: Upload universal jar artifact
         if: runner.os == 'Linux'
         uses: actions/upload-artifact@v4
         with:
           name: BlackHole-jar
-          path: target/BlackHole-universal.jar
+          path: target/BlackHole-${{ env.ASSET_VER }}-universal.jar
 
   release:
     if: github.ref_type == 'tag'   # 只有 tag 推送才发 Release
