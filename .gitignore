@@ -1,0 +1,14 @@
+target/
+*.class
+*.jar
+.idea/
+.vscode/
+*.iml
+*.iws
+out/
+*.png
+shader-cache/
+*.log
+
+# 着色器编译产物(运行时由 ShaderCompiler 自动再生,勿入库)
+resources/shaders/*.spv
