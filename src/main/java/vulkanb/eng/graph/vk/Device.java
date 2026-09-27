@@ -94,13 +94,15 @@ public class Device {
             if (samplerAnisotropy) {
                 features.samplerAnisotropy(true);
             }
-            features.geometryShader(true);
+            // 以下特性按物理设备实际支持启用：MoltenVK 基于 Metal，不支持几何
+            // 着色器，无条件开启会导致 vkCreateDevice 报 VK_ERROR_FEATURE_NOT_PRESENT
+            features.geometryShader(supportedFeatures.geometryShader());
             // 深度钳制（可选）
             depthClamp = supportedFeatures.depthClamp();
             features.depthClamp(depthClamp);
-            features.multiDrawIndirect(true);
-            features.shaderInt64(true);
-            features.drawIndirectFirstInstance(true);
+            features.multiDrawIndirect(supportedFeatures.multiDrawIndirect());
+            features.shaderInt64(supportedFeatures.shaderInt64());
+            features.drawIndirectFirstInstance(supportedFeatures.drawIndirectFirstInstance());
 
             // 构建特性链：features2 → features12 → features13
             features2.pNext(features12.address());
