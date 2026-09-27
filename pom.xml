@@ -16,7 +16,7 @@
         <maven.compiler.source>17</maven.compiler.source>
         <maven.compiler.target>17</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <lwjgl.version>3.3.4</lwjgl.version>
+        <lwjgl.version>3.4.3</lwjgl.version>
         <imgui-java.version>1.92.0</imgui-java.version>
     </properties>
 
@@ -146,6 +146,12 @@
         </dependency>
         <dependency>
             <groupId>org.lwjgl</groupId>
+            <artifactId>lwjgl-vulkan</artifactId>
+            <version>${lwjgl.version}</version>
+            <classifier>natives-macos</classifier>
+        </dependency>
+        <dependency>
+            <groupId>org.lwjgl</groupId>
             <artifactId>lwjgl-shaderc</artifactId>
             <version>${lwjgl.version}</version>
             <classifier>natives-macos</classifier>
@@ -178,6 +184,12 @@
         </dependency>
         <dependency>
             <groupId>org.lwjgl</groupId>
+            <artifactId>lwjgl-vulkan</artifactId>
+            <version>${lwjgl.version}</version>
+            <classifier>natives-macos-arm64</classifier>
+        </dependency>
+        <dependency>
+            <groupId>org.lwjgl</groupId>
             <artifactId>lwjgl-shaderc</artifactId>
             <version>${lwjgl.version}</version>
             <classifier>natives-macos-arm64</classifier>
@@ -205,6 +217,12 @@
         <dependency>
             <groupId>io.github.spair</groupId>
             <artifactId>imgui-java-natives-linux</artifactId>
+            <version>${imgui-java.version}</version>
+            <scope>runtime</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.github.spair</groupId>
+            <artifactId>imgui-java-natives-macos</artifactId>
             <version>${imgui-java.version}</version>
             <scope>runtime</scope>
         </dependency>
