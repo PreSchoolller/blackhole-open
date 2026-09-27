@@ -441,6 +441,7 @@ public class Panels {
         helpRow("R", "Circular orbit (Geodesic)");
         helpRow("1 / 2", "v0 -/+ 0.05c");
         helpRow("Numpad +/-", "Temperature -/+ (K)");
+        helpRow("P", "Pause time (Geodesic)");
         ImGui.end();
     }
 
