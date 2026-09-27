@@ -44,20 +44,6 @@
             <artifactId>lwjgl-vulkan</artifactId>
             <version>${lwjgl.version}</version>
         </dependency>
-        <!-- Natives - macOS（内含 MoltenVK。LWJGL 3.3.4 的 dylib 缺 ad-hoc 签名会被 dyld 杀进程，须 3.3.5+；
-             3.4.x 捆绑 MoltenVK 1.4.1，支持 Vulkan 1.3/1.4。Windows/Linux 不需要：Vulkan loader 由驱动提供 -->
-        <dependency>
-            <groupId>org.lwjgl</groupId>
-            <artifactId>lwjgl-vulkan</artifactId>
-            <version>${lwjgl.version}</version>
-            <classifier>natives-macos</classifier>
-        </dependency>
-        <dependency>
-            <groupId>org.lwjgl</groupId>
-            <artifactId>lwjgl-vulkan</artifactId>
-            <version>${lwjgl.version}</version>
-            <classifier>natives-macos-arm64</classifier>
-        </dependency>
         <dependency>
             <groupId>org.lwjgl</groupId>
             <artifactId>lwjgl-shaderc</artifactId>
@@ -160,6 +146,12 @@
         </dependency>
         <dependency>
             <groupId>org.lwjgl</groupId>
+            <artifactId>lwjgl-vulkan</artifactId>
+            <version>${lwjgl.version}</version>
+            <classifier>natives-macos</classifier>
+        </dependency>
+        <dependency>
+            <groupId>org.lwjgl</groupId>
             <artifactId>lwjgl-shaderc</artifactId>
             <version>${lwjgl.version}</version>
             <classifier>natives-macos</classifier>
@@ -187,6 +179,12 @@
         <dependency>
             <groupId>org.lwjgl</groupId>
             <artifactId>lwjgl-glfw</artifactId>
+            <version>${lwjgl.version}</version>
+            <classifier>natives-macos-arm64</classifier>
+        </dependency>
+        <dependency>
+            <groupId>org.lwjgl</groupId>
+            <artifactId>lwjgl-vulkan</artifactId>
             <version>${lwjgl.version}</version>
             <classifier>natives-macos-arm64</classifier>
         </dependency>
