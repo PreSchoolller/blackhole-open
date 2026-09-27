@@ -12,3 +12,6 @@ shader-cache/
 
 # 着色器编译产物(运行时由 ShaderCompiler 自动再生,勿入库)
 resources/shaders/*.spv
+
+# shade 插件每次构建生成,无保留价值
+dependency-reduced-pom.xml
