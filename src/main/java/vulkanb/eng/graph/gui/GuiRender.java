@@ -10,6 +10,7 @@ import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.vulkan.*;
 import vulkanb.eng.EngCtx;
 import vulkanb.eng.graph.vk.*;
+import vulkanb.eng.wnd.Window;
 
 import java.nio.ByteBuffer;
 import java.nio.FloatBuffer;
@@ -83,9 +84,12 @@ public class GuiRender {
         ImGui.createContext();
         ImGuiIO io = ImGui.getIO();
         io.setIniFilename(null);
-        VkExtent2D extent = vkCtx.getSwapChain().getSwapChainExtent();
-        io.setDisplaySize(extent.width(), extent.height());
-        io.setDisplayFramebufferScale(1.0f, 1.0f);
+        // ImGui 布局用窗口逻辑坐标（与 GLFW 光标同一坐标系，macOS 上点击才不会错位），
+        // 像素密度交给 FramebufferScale（Retina=2），投影时再乘回去
+        Window window = engCtx.window();
+        float scale = window.getContentScale();
+        io.setDisplaySize(window.getLogicalWidth(), window.getLogicalHeight());
+        io.setDisplayFramebufferScale(scale, scale);
 
         // 2. 字体图集像素 → Vulkan 纹理（一次性命令提交）
         ImInt texWidth = new ImInt();
@@ -339,11 +343,11 @@ public class GuiRender {
             vkCmdBindVertexBuffers(cmdHandle, 0, vtxBuffer, offsets);
             vkCmdBindIndexBuffer(cmdHandle, buffsIdx[currentFrame].getBuffer(), 0, VK_INDEX_TYPE_UINT16);
 
-            // push constant：NDC 缩放（ImGui 像素坐标 → [-1,1]）
+            // push constant：NDC 缩放（ImGui 逻辑坐标 × 帧缓冲缩放 → 像素 → [-1,1]）
             ImGuiIO io = ImGui.getIO();
             FloatBuffer pushConstantBuffer = stack.mallocFloat(2);
-            pushConstantBuffer.put(0, 2.0f / io.getDisplaySizeX());
-            pushConstantBuffer.put(1, -2.0f / io.getDisplaySizeY());
+            pushConstantBuffer.put(0, 2.0f / (io.getDisplaySizeX() * io.getDisplayFramebufferScaleX()));
+            pushConstantBuffer.put(1, -2.0f / (io.getDisplaySizeY() * io.getDisplayFramebufferScaleY()));
             vkCmdPushConstants(cmdHandle, pipeline.getVkPipelineLayout(),
                     VK_SHADER_STAGE_VERTEX_BIT, 0, pushConstantBuffer);
 
@@ -380,10 +384,12 @@ public class GuiRender {
         }
     }
 
-    /** 窗口尺寸变化：同步 ImGui 显示尺寸（renderArea 每帧刷新，无需重建） */
-    public void resize(VkCtx vkCtx) {
-        VkExtent2D extent = vkCtx.getSwapChain().getSwapChainExtent();
-        ImGui.getIO().setDisplaySize(extent.width(), extent.height());
+    /** 窗口尺寸变化：同步 ImGui 显示尺寸（逻辑坐标 + 帧缓冲缩放，同 init） */
+    public void resize(VkCtx vkCtx, EngCtx engCtx) {
+        Window window = engCtx.window();
+        float scale = window.getContentScale();
+        ImGui.getIO().setDisplaySize(window.getLogicalWidth(), window.getLogicalHeight());
+        ImGui.getIO().setDisplayFramebufferScale(scale, scale);
     }
 
     /** 把 ImGui draw data 拼入本帧插槽的顶点/索引缓冲（HOST_VISIBLE，按需增长只增不缩） */

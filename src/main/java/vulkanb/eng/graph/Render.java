@@ -337,6 +337,6 @@ public class Render {
         } else {
             blackHoleRender.resize(vkCtx, extent.width(), extent.height());
         }
-        guiRender.resize(vkCtx);
+        guiRender.resize(vkCtx, engCtx);
     }
 }

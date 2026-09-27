@@ -174,6 +174,8 @@ public class Panels {
         double fps = avgFrameMs > 0 ? 1000.0 / avgFrameMs : 0;
         ImGui.text(String.format("  FPS : %.0f(FrameTime %.1f ms)", fps, avgFrameMs));
         ImGui.text(String.format("  Resolution: %d x %d", window.getWidth(), window.getHeight()));
+        ImGui.text(String.format("  Window: %d x %d pts (scale %.1f)",
+                window.getLogicalWidth(), window.getLogicalHeight(), window.getContentScale()));
         ImGui.text(String.format("  BaseTemperature: %.0f K(NumPad +/- Adjust)", BlackHoleRender.BaseTemperature));
 
         // [场景]
