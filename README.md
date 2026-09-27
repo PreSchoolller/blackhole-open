@@ -117,6 +117,7 @@ Vibe coding 兴起，恰逢各家模型在自家 Agent 平台上限免，遂尝�
 
 大数据或许是知道了我的意图，也或许是那时候大家都在让 AI 干这件事儿——B 站给我推了 UP 主 Baopinsui（[space.bilibili.com/95332087](https://space.bilibili.com/95332087)）的视频，太惊艳了。遂循着其动态找到了他的知乎文章《[从零开始搓一个黑洞——glsl编程实战](https://zhuanlan.zhihu.com/p/20536269771)》，当时已 0 点，顶着困意看完——详细的开发流程和公式推导让我在想：能不能把它搬到我的 vibe coding 项目上呢？于是就有了本项目的大更新。
 
-期间先后用过 MimoCode（时值 mimo v2.5 免费）、本地 Qwen（图一乐）、讯飞星辰（时值 Qwen 系列免费）、最近的 ZCode（周末 glm-5.3-flash）、以及全程在线的 DeepSeek（Chat 对话询问式"古法"）。做到现在，跟 NPGS 项目差距还是好大，作者牛逼哦！
+期间先后用过 MimoCode（时值 mimo v2.5 免费）、本地 Qwen（图一乐）、讯飞星辰（时值 Qwen 系列免费）、opencode（免费模型）、AMD cloud（免费模型）、最近的 ZCode（周末 glm-5.3-flash）、以及全程在线的 DeepSeek（Chat 对话询问式"古法"）。做到现在，跟 NPGS 项目差距还是好大，作者牛逼哦！
 
 因为开发过程多有不规范、不合适、不隐私的历史，所以决定新开仓库将代码公开——前文提及的旧仓库内容在本项目里是看不到的，见谅。
+（完整的私有仓提交史已整理为 [foragent/HISTORY.md](foragent/HISTORY.md)，算是一份变相的开发年轮。）
