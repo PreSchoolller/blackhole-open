@@ -59,3 +59,4 @@ SOFTWARE.
 | shaderc / glslang / SPIRV-Tools（经 LWJGL 绑定，运行时 GLSL→SPIR-V） | Apache-2.0（glslang 含 LLVM 例外） | <https://github.com/google/shaderc> |
 | stb（stb_image，经 lwjgl-stb） | Public Domain / MIT | <https://github.com/nothings/stb> |
 | Vulkan Memory Allocator（经 LWJGL 绑定） | MIT | <https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator> |
+| MoltenVK（仅 macOS 发行包内捆绑 `libMoltenVK.dylib`，以 loader-less 方式直连） | Apache-2.0 | <https://github.com/KhronosGroup/MoltenVK> |
