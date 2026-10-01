@@ -25,7 +25,9 @@ import static vulkanb.eng.graph.vk.VkUtils.vkCheck;
  *   <li>使用全屏四边形（无顶点缓冲区）覆盖整个屏幕</li>
  *   <li>顶点着色器通过逆投影/逆视图矩阵将屏幕坐标反投影为世界空间射线</li>
  *   <li>片段着色器对每条射线执行光线步进（ray marching），模拟引力透镜效应</li>
- *   <li>通过 Push Constants 传递相机矩阵、黑洞参数等数据到 GPU</li>
+ *   <li>通过参数 UBO（BlackHoleArgs，std140，每帧插槽一份、整块重写）传递相机矩阵、
+ *       黑洞参数等数据到 GPU（2026-09-27 自 push constant 迁移,容量不再受 256B 限制,
+ *       见 foragent/schwarzschild_ubo_panel_plan.md）</li>
  *   <li>TAA：HDR 输出到历史缓冲，片段着色器在 HDR 域与上一帧累积结果混合
  *       （静止全量累积；运动硬重置）；相机/投影变化时自动重置累积</li>
  *   <li>Bloom：合成 pass 读取本帧 HDR 历史，亮部提取 + 圆盘模糊 + 色调映射后写交换链</li>
@@ -35,7 +37,8 @@ import static vulkanb.eng.graph.vk.VkUtils.vkCheck;
  * 2 张历史图，插槽 s 读 hist[s][r]、写 hist[s][w]，下次运行（2 帧后，栅栏已保证
  * GPU 完成）翻转读写。插槽之间互不读写，因此无需跨帧信号量，同步完全自包含。
  * <p>
- * Push Constants 内存布局（共 224 字节）：
+ * BlackHoleArgs 参数 UBO 内存布局（std140，共 272 字节 = 264 数据对齐 16；绑定为
+ * 主管线 set 2 / bloom 管线 set 1，顶点+片段两阶段可见；三个 shader 的块声明逐字段一致）：
  * <pre>
  * [  0.. 63]  inverseView    mat4   (64 bytes)
  * [ 64..127]  inverseProj    mat4   (64 bytes)
@@ -45,10 +48,10 @@ import static vulkanb.eng.graph.vk.VkUtils.vkCheck;
  * [156..159]  schwarzschildRadius float (4 bytes)，世界坐标长度单位
  * [160..163]  diskInnerRadius      float (4 bytes)，Rs 的倍数
  * [164..167]  diskOuterRadius      float (4 bytes)，Rs 的倍数
- * [168..171]  rotationSpeed        float (4 bytes)
+ * [168..171]  iExposure            float (4 bytes)，曝光增益（原 rotationSpeed 死字段槽位复用）
  * [172..175]  temperature          float (4 bytes)，基础温度(K)
- * [176..179]  if_dopplerI          int   (4 bytes)
- * [180..183]  if_dopplerT          int   (4 bytes)
+ * [176..179]  if_dopplerI          int   (4 bytes)，多普勒亮度 A/B 开关
+ * [180..183]  if_dopplerT          int   (4 bytes)，多普勒温度 A/B 开关
  * [184..187]  timeRate             float (4 bytes)，动画时间速率
  * [188..191]  iTimeDelta           float (4 bytes)，帧间隔（秒），TAA 用
  * [192..195]  iFrame               int   (4 bytes)，全局帧计数，TAA 用
@@ -57,19 +60,33 @@ import static vulkanb.eng.graph.vk.VkUtils.vkCheck;
  * [204..207]  iFade                float (4 bytes)，视界坠落淡出系数 0..1（兼作对齐）
  * [208..219]  iCameraVel           vec3  (12 bytes)，相机速度 β（单位 c，静态观者系；测地模式）
  * [220..223]  iCameraGamma         float (4 bytes)，相机洛伦兹因子 γ
+ * [224..227]  iDiskScatter         float (4 bytes)，盘前向散射强度（0=关）
+ * [228..231]  iDiskAmbient         float (4 bytes)，盘环境光强度（0=关）
+ * [232..235]  iShiftMax            float (4 bytes)，盘频移钳制上限
+ * [236..239]  iTaaTau              float (4 bytes)，TAA 静止累积 τ 基准秒
+ * [240..243]  iBloomThreshold      float (4 bytes)，Bloom 亮部阈值
+ * [244..247]  iBloomMix            float (4 bytes)，Bloom 辉光混合系数
+ * [248..251]  iBloomMax            float (4 bytes)，Bloom 色调映射输出上限
+ * [252..255]  iBackgroundBright    float (4 bytes)，背景亮度倍率（默认 0.7）
+ * [256..259]  iToneMapStrength     float (4 bytes)，色调映射强度（默认 1.0）
+ * [260..263]  iDiskHalfThickness   float (4 bytes)，盘半厚基准（Rs 倍数，默认 0.5）
+ * [264..271]  std140 尾部对齐填充（8 bytes）
  * </pre>
  */
 public class BlackHoleRender {
 
     /** TAA 历史缓冲格式（HDR 浮点，保证混合精度；交换链格式经 SwapChain.getImageFormat() 获取） */
     private static final int TAA_HISTORY_FORMAT = VK_FORMAT_R32G32B32A32_SFLOAT;
-    /** Push Constants 总字节数（必须与着色器中声明的大小一致；vec3 成员要求 16 字节对齐） */
-    private static final int PUSH_CONSTANTS_SIZE = 224;
-    /** 基础温度（K）：初值来自 eng.properties，运行时可用小键盘 +/- 调节（上限/步长同在配置中） */
-    public static float BaseTemperature = EngCfg.getInstance().getBaseTemperature();
+    /** 参数 UBO 字节数（BlackHoleArgs std140：264B 数据对齐 16 → 272；必须与三 shader 声明一致） */
+    private static final int BH_ARGS_SIZE = 272;
 
-    /** Push Constants 数据的原生内存缓冲区（直接内存，用于 vkCmdPushConstants） */
-    private final ByteBuffer pushConstBuff;
+    /** 参数 UBO（BlackHoleArgs，每帧插槽一份，持久映射，packParams 每帧整块重写） */
+    private final VkBuffer[] argsUbo = new VkBuffer[2];
+    private final long[] argsMapped = new long[2];
+    /** 参数 UBO 描述符集布局（binding 0 = BlackHoleArgs，顶点+片段两阶段；主管线 set 2 / bloom set 1） */
+    private DescSetLayout argsDescLayout;
+    /** 参数 UBO 描述符集（每帧插槽一份，指向本插槽 UBO） */
+    private DescSet[] argsDescSets;
     /** 图形管线（包含管线布局和管线对象） */
     private Pipeline pipeline;
     /** 双星空盒（主星空 + 山海，GUI 在 set0.b0 换绑切换，惰性加载） */
@@ -134,12 +151,11 @@ public class BlackHoleRender {
 
     /**
      * 构造黑洞渲染器。
-     * 分配 Push Constants 缓冲区并记录启动时间。
+     * 记录启动时间（参数 UBO 等资源在 init() 创建）。
      *
      * @param vkCtx Vulkan 上下文
      */
     public BlackHoleRender(VkCtx vkCtx) {
-        pushConstBuff = MemoryUtil.memAlloc(PUSH_CONSTANTS_SIZE);
         startTime = System.nanoTime();
         lastFrameNanos = 0;
         taaFrameCount = 0;
@@ -167,6 +183,11 @@ public class BlackHoleRender {
         // Bloom 场景描述符集布局：set 0，binding 0 = 本帧 HDR 历史
         bloomSceneLayout = new DescSetLayout(vkCtx, new DescSetLayout.LayoutInfo(
                 VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, 1, VK_SHADER_STAGE_FRAGMENT_BIT));
+        // 参数 UBO 描述符集布局：binding 0 = BlackHoleArgs；顶点（反投影矩阵）与片段（场景参数）
+        // 两阶段共用。主管线绑 set 2、bloom 管线绑 set 1（同一 DescSet 实例，两处布局各占一号）
+        argsDescLayout = new DescSetLayout(vkCtx, new DescSetLayout.LayoutInfo(
+                VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0, 1,
+                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT));
 
         // 创建 TAA 历史缓冲（按交换链尺寸）
         SwapChain swapChain = vkCtx.getSwapChain();
@@ -181,13 +202,24 @@ public class BlackHoleRender {
             prevCamMapped[i] = prevCamUbo[i].map(vkCtx);
         }
 
-        // 分配 TAA / Bloom 描述符集（每帧插槽一份；历史视图每帧渲染前更新）
+        // 参数 UBO（每插槽一份，持久映射；packParams 每帧整块重写，主机写 GPU 读按帧栅栏隔离）
+        for (int i = 0; i < VkUtils.MAX_IN_FLIGHT; i++) {
+            argsUbo[i] = new VkBuffer(vkCtx, BH_ARGS_SIZE,
+                    VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO,
+                    VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT, 0);
+            argsMapped[i] = argsUbo[i].map(vkCtx);
+        }
+
+        // 分配 TAA / Bloom / 参数描述符集（每帧插槽一份；历史视图每帧渲染前更新）
         taaDescSets = new DescSet[VkUtils.MAX_IN_FLIGHT];
         bloomDescSets = new DescSet[VkUtils.MAX_IN_FLIGHT];
+        argsDescSets = new DescSet[VkUtils.MAX_IN_FLIGHT];
         for (int i = 0; i < VkUtils.MAX_IN_FLIGHT; i++) {
             taaDescSets[i] = vkCtx.getDescAllocator().addDescSet(vkCtx.getDevice(), "blackhole-taa-" + i, taaDescLayout);
             taaDescSets[i].setBuffer(vkCtx.getDevice(), prevCamUbo[i], 64, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
             bloomDescSets[i] = vkCtx.getDescAllocator().addDescSet(vkCtx.getDevice(), "blackhole-bloom-" + i, bloomSceneLayout);
+            argsDescSets[i] = vkCtx.getDescAllocator().addDescSet(vkCtx.getDevice(), "blackhole-args-" + i, argsDescLayout);
+            argsDescSets[i].setBuffer(vkCtx.getDevice(), argsUbo[i], BH_ARGS_SIZE, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
         }
 
         // 创建着色器模块（从 SPIR-V 文件加载）
@@ -197,25 +229,20 @@ public class BlackHoleRender {
 
         // 空顶点缓冲结构：全屏四边形不使用顶点数据，由 gl_VertexIndex 生成
         var vtxBuffStruct = new EmptyVtxBuffStruct();
-        var pushRanges = new PushConstRange[]{
-                new PushConstRange(VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                        0, PUSH_CONSTANTS_SIZE)
-        };
 
         // 主管线：黑洞场景（HDR 输出到 TAA 历史，单附件）
         var buildInfo = new PipelineBuildInfo(new ShaderModule[]{vertModule, fragModule}, vtxBuffStruct.getVi(),
                 new int[]{TAA_HISTORY_FORMAT})
-                .setPushConstRanges(pushRanges)
-                // 声明描述符集布局：set 0 = 天空盒，set 1 = TAA 历史
-                .setDescSetLayouts(new DescSetLayout[]{skyboxDescLayout, taaDescLayout});
+                // 声明描述符集布局：set 0 = 天空盒，set 1 = TAA 历史，set 2 = 参数 UBO
+                .setDescSetLayouts(new DescSetLayout[]{skyboxDescLayout, taaDescLayout, argsDescLayout});
         pipeline = new Pipeline(vkCtx, buildInfo);
 
         // Bloom 合成管线：读 HDR 历史 → 交换链（颜色格式必须用交换链真实格式，
         // 管线声明与动态渲染附件不一致属未定义行为，验证层 VUID 06580 会报）
         var bloomBuildInfo = new PipelineBuildInfo(new ShaderModule[]{vertModule, bloomModule}, vtxBuffStruct.getVi(),
                 new int[]{vkCtx.getSwapChain().getImageFormat()})
-                .setPushConstRanges(pushRanges)
-                .setDescSetLayouts(new DescSetLayout[]{bloomSceneLayout});
+                // 声明描述符集布局：set 0 = 本帧 HDR 历史，set 1 = 参数 UBO（frag 读 iFade）
+                .setDescSetLayouts(new DescSetLayout[]{bloomSceneLayout, argsDescLayout});
         bloomPipeline = new Pipeline(vkCtx, bloomBuildInfo);
 
         vtxBuffStruct.cleanup();
@@ -386,7 +413,6 @@ public class BlackHoleRender {
 
     /** 释放所有 GPU 资源 */
     public void cleanup(VkCtx vkCtx) {
-        MemoryUtil.memFree(pushConstBuff);
         if (skyboxDescSet != null) {
             vkCtx.getDescAllocator().freeDescSet(vkCtx.getDevice(), "blackhole-skybox");
         }
@@ -400,6 +426,11 @@ public class BlackHoleRender {
                 vkCtx.getDescAllocator().freeDescSet(vkCtx.getDevice(), "blackhole-bloom-" + i);
             }
         }
+        if (argsDescSets != null) {
+            for (int i = 0; i < argsDescSets.length; i++) {
+                vkCtx.getDescAllocator().freeDescSet(vkCtx.getDevice(), "blackhole-args-" + i);
+            }
+        }
         if (skyboxDescLayout != null) {
             skyboxDescLayout.cleanup(vkCtx);
         }
@@ -409,6 +440,9 @@ public class BlackHoleRender {
         if (bloomSceneLayout != null) {
             bloomSceneLayout.cleanup(vkCtx);
         }
+        if (argsDescLayout != null) {
+            argsDescLayout.cleanup(vkCtx);
+        }
         if (dualSkybox != null) {
             dualSkybox.cleanup(vkCtx);
         }
@@ -417,6 +451,10 @@ public class BlackHoleRender {
             if (prevCamUbo[i] != null) {
                 prevCamUbo[i].cleanup(vkCtx);   // 内部含 unMap
                 prevCamUbo[i] = null;
+            }
+            if (argsUbo[i] != null) {
+                argsUbo[i].cleanup(vkCtx);      // 内部含 unMap
+                argsUbo[i] = null;
             }
         }
         if (bloomSampler != 0) {
@@ -500,10 +538,11 @@ public class BlackHoleRender {
             // 绑定图形管线
             vkCmdBindPipeline(cmdHandle, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.getVkPipeline());
 
-            // 绑定描述符集：set 0 = 天空盒，set 1 = TAA 历史
+            // 绑定描述符集：set 0 = 天空盒，set 1 = TAA 历史，set 2 = 参数 UBO
             vkCmdBindDescriptorSets(cmdHandle, VK_PIPELINE_BIND_POINT_GRAPHICS,
                     pipeline.getVkPipelineLayout(), 0,
-                    stack.longs(skyboxDescSet.getVkDescriptorSet(), taaDescSets[slot].getVkDescriptorSet()),
+                    stack.longs(skyboxDescSet.getVkDescriptorSet(), taaDescSets[slot].getVkDescriptorSet(),
+                            argsDescSets[slot].getVkDescriptorSet()),
                     null);
 
             int width = extent.width();
@@ -524,8 +563,8 @@ public class BlackHoleRender {
                     .offset(it -> it.x(0).y(0));
             vkCmdSetScissor(cmdHandle, 0, scissor);
 
-            // 通过 Push Constants 传递相机和黑洞参数
-            setPushConstants(cmdHandle, engCtx, width, height, slot);
+            // 每帧整块重写本插槽参数 UBO（相机/时间/TAA/黑洞参数，std140 布局与三 shader 一致）
+            packParams(engCtx, slot);
 
             // 绘制全屏四边形（6 个顶点，两个三角形）
             vkCmdDraw(cmdHandle, 6, 1, 0, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
@@ -568,14 +607,11 @@ public class BlackHoleRender {
 
             vkCmdBindPipeline(cmdHandle, VK_PIPELINE_BIND_POINT_GRAPHICS, bloomPipeline.getVkPipeline());
 
-            // 绑定描述符集：set 0 = 本帧 HDR 历史
+            // 绑定描述符集：set 0 = 本帧 HDR 历史，set 1 = 参数 UBO（frag 消费 iFade）
             vkCmdBindDescriptorSets(cmdHandle, VK_PIPELINE_BIND_POINT_GRAPHICS,
                     bloomPipeline.getVkPipelineLayout(), 0,
-                    stack.longs(bloomDescSets[slot].getVkDescriptorSet()), null);
-
-            // Push Constants 数据不变，针对合成管线布局重新下发
-            vkCmdPushConstants(cmdHandle, bloomPipeline.getVkPipelineLayout(),
-                    VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, pushConstBuff);
+                    stack.longs(bloomDescSets[slot].getVkDescriptorSet(), argsDescSets[slot].getVkDescriptorSet()),
+                    null);
 
             vkCmdDraw(cmdHandle, 6, 1, 0, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
 
@@ -588,20 +624,21 @@ public class BlackHoleRender {
     }
 
     /**
-     * 设置 Push Constants 数据。
+     * 打包参数 UBO 数据（BlackHoleArgs，std140）。
      * <p>
-     * 将相机逆矩阵、投影逆矩阵、相机位置、时间、黑洞参数、TAA 参数打包到
-     * 204 字节的直接内存缓冲区中，通过 vkCmdPushConstants 传递给 GPU。
+     * 将相机逆矩阵、投影逆矩阵、相机位置、时间、黑洞参数、TAA 参数逐字段写入
+     * 本插槽持久映射的 UBO 内存（字节偏移与类注释布局表一致），着色器经
+     * 描述符集读取（主管线 set 2 / bloom 管线 set 1）。
      *
-     * @param cmdHandle 命令缓冲区句柄
-     * @param engCtx    引擎上下文
-     * @param width     渲染宽度
-     * @param height    渲染高度
-     * @param slot      当前帧插槽索引（0/1，用于按插槽跟踪历史可信度）
+     * @param engCtx 引擎上下文
+     * @param slot   当前帧插槽索引（0/1，用于按插槽跟踪历史可信度）
      */
-    private void setPushConstants(VkCommandBuffer cmdHandle, EngCtx engCtx, int width, int height, int slot) {
+    private void packParams(EngCtx engCtx, int slot) {
+        ByteBuffer args = MemoryUtil.memByteBuffer(argsMapped[slot], BH_ARGS_SIZE);
         Camera camera = engCtx.scene().getCamera();
         var projection = engCtx.scene().getProjection();
+        // 用户可调量（GUI 滑条/快捷键写, eng.properties 初始化）统一取自参数包
+        var params = engCtx.scene().getSchwarzschildParams();
 
         // 墙钟时间（秒，自启动起）：驱动 TAA 抖动种子（iRenderTime），暂停时仍流动
         float wallTime = (float) ((System.nanoTime() - startTime) / 1_000_000_000.0);
@@ -627,59 +664,59 @@ public class BlackHoleRender {
         int offset = 0;
 
         // inverseView 矩阵（64 字节 = 4×4 float）
-        invView.get(offset, pushConstBuff);
+        invView.get(offset, args);
         offset += 64;
 
         // inverseProj 矩阵（64 字节）
-        invProj.get(offset, pushConstBuff);
+        invProj.get(offset, args);
         offset += 64;
 
         // 相机世界坐标位置（12 字节 = vec3）
-        camera.getPosition().get(offset, pushConstBuff);
+        camera.getPosition().get(offset, args);
         offset += 12;
 
         // 动画时间（4 字节 = float）
-        pushConstBuff.putFloat(offset, time);
+        args.putFloat(offset, time);
         offset += 4;
 
         // 黑洞世界坐标位置（12 字节 = vec3），固定在原点 (0,0,0)
-        pushConstBuff.putFloat(offset, 0.0f);
-        pushConstBuff.putFloat(offset + 4, 0.0f);
-        pushConstBuff.putFloat(offset + 8, 0.0f);
+        args.putFloat(offset, 0.0f);
+        args.putFloat(offset + 4, 0.0f);
+        args.putFloat(offset + 8, 0.0f);
         offset += 12;
 
         // 史瓦西半径（4 字节 = float），世界坐标长度单位（eng.properties: blackhole.schwarzschildRadius）；
         // frag 中所有公式显式使用该值，盘半径以 Rs 倍数传入并在此约定下换算
-        pushConstBuff.putFloat(offset, EngCfg.getInstance().getSchwarzschildRadius());
+        args.putFloat(offset, EngCfg.getInstance().getSchwarzschildRadius());
         offset += 4;
 
         // 吸积盘内半径（4 字节 = float），Rs 的倍数（3.0 = 3·Rs ≈ ISCO），frag 内乘 Rs 换算
-        pushConstBuff.putFloat(offset, EngCfg.getInstance().getDiskInnerRadius());
+        args.putFloat(offset, params.diskInnerRadiusRs);
         offset += 4;
 
         // 吸积盘外半径（4 字节 = float），Rs 的倍数，frag 内乘 Rs 换算
         // （18：小盘流畅；调大会显著增加 raymarch 步数与 TAA 拖影面积）
-        pushConstBuff.putFloat(offset, EngCfg.getInstance().getDiskOuterRadius());
+        args.putFloat(offset, params.diskOuterRadiusRs);
         offset += 4;
 
-        // 吸积盘旋转速度（4 字节 = float；着色器当前未消费——盘转速由 frag 内 omega() 决定）
-        pushConstBuff.putFloat(offset, 0.5f);
+        // iExposure：曝光增益（4 字节 = float；原 rotationSpeed 死字段槽位复用，Phase 3）
+        args.putFloat(offset, params.exposure);
         offset += 4;
 
         // 基础温度 (K)，默认 15000K
-        pushConstBuff.putFloat(offset, BaseTemperature);
+        args.putFloat(offset, params.baseTemperature);
         offset += 4;
 
-        // 多普勒亮度调制开关 (int)，1=开启
-        pushConstBuff.putInt(offset, 1);
+        // if_dopplerI：多普勒亮度 A/B 开关 (int)，1=开启（原行为）
+        args.putInt(offset, params.dopplerIntensityEnabled ? 1 : 0);
         offset += 4;
 
-        // 多普勒温度偏移开关 (int)，1=开启
-        pushConstBuff.putInt(offset, 1);
+        // if_dopplerT：多普勒温度 A/B 开关 (int)，1=开启（原行为）
+        args.putInt(offset, params.dopplerTemperatureEnabled ? 1 : 0);
         offset += 4;
 
         // timeRate：时间速率（用于动画速度）
-        pushConstBuff.putFloat(offset, EngCfg.getInstance().getTimeRate());
+        args.putFloat(offset, EngCfg.getInstance().getTimeRate());
         offset += 4;
 
         // iTimeDelta：帧间隔（秒），TAA blendWeight 用
@@ -687,11 +724,11 @@ public class BlackHoleRender {
         float timeDelta = lastFrameNanos == 0 ? 0.0f : (float) ((now - lastFrameNanos) / 1_000_000_000.0);
         lastFrameNanos = now;
         timeDelta = Math.max(0.0f, Math.min(timeDelta, 0.1f));
-        pushConstBuff.putFloat(offset, timeDelta);
+        args.putFloat(offset, timeDelta);
         offset += 4;
 
         // iFrame：全局帧计数（shader 中前 2 帧强制重置）
-        pushConstBuff.putInt(offset, taaFrameCount);
+        args.putInt(offset, taaFrameCount);
         offset += 4;
 
         // iCameraMoved 三态：
@@ -717,33 +754,67 @@ public class BlackHoleRender {
         taaForceReset[slot] = false;
         prevViewPerSlot[slot].set(camera.getViewMatrix());
         prevProjPerSlot[slot].set(projection.getProjectionMatrix());
-        pushConstBuff.putInt(offset, cameraMoved);
+        args.putInt(offset, cameraMoved);
         offset += 4;
 
         // iRenderTime：渲染时间（墙钟，时间暂停时仍流动）——TAA 抖动种子用，与模拟时间 time 解耦
-        pushConstBuff.putFloat(offset, wallTime);
+        args.putFloat(offset, wallTime);
         offset += 4;
 
         // iFade：视界坠落淡出系数（非演出时为 0，画面正常）
-        pushConstBuff.putFloat(offset, engCtx.scene().getGeodesic().getHorizonFade());
+        args.putFloat(offset, engCtx.scene().getGeodesic().getHorizonFade());
         offset += 4;
 
         // iCameraVel：相机速度 β 向量（单位 c，静态观者系；非测地模式为 0 → 多普勒因子恒 1）
         Vector3f cameraBeta = engCtx.scene().getGeodesic().getBeta();
-        pushConstBuff.putFloat(offset, cameraBeta.x);
+        args.putFloat(offset, cameraBeta.x);
         offset += 4;
-        pushConstBuff.putFloat(offset, cameraBeta.y);
+        args.putFloat(offset, cameraBeta.y);
         offset += 4;
-        pushConstBuff.putFloat(offset, cameraBeta.z);
+        args.putFloat(offset, cameraBeta.z);
         offset += 4;
 
         // iCameraGamma：相机洛伦兹因子 γ
-        pushConstBuff.putFloat(offset, engCtx.scene().getGeodesic().getGamma());
+        args.putFloat(offset, engCtx.scene().getGeodesic().getGamma());
         offset += 4;
 
-        // 提交 Push Constants 到 GPU
-        vkCmdPushConstants(cmdHandle, pipeline.getVkPipelineLayout(),
-                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, pushConstBuff);
+        // iDiskScatter：盘前向散射强度（背光项，被盘消光的背景光散射回视线的比例，0=关）
+        args.putFloat(offset, params.diskScatter);
+        offset += 4;
+
+        // iDiskAmbient：盘环境光强度（弥散项，全天空辐照×盘密度并入发射，0=关）
+        args.putFloat(offset, params.diskAmbient);
+        offset += 4;
+
+        // iShiftMax：盘频移钳制上限（原 shader 硬编码 2.5）
+        args.putFloat(offset, params.shiftMax);
+        offset += 4;
+
+        // iTaaTau：TAA 静止累积 τ 基准秒（原 shader 硬编码 0.3）
+        args.putFloat(offset, params.taaTau);
+        offset += 4;
+
+        // iBloomThreshold / iBloomMix / iBloomMax：Bloom 三参数（原 bloomComposite 硬编码）
+        args.putFloat(offset, params.bloomThreshold);
+        offset += 4;
+        args.putFloat(offset, params.bloomMix);
+        offset += 4;
+        args.putFloat(offset, params.bloomMax);
+        offset += 4;
+
+        // iBackgroundBright：背景亮度倍率（原硬编码 0.7,散射项随 Bg 同步缩放）
+        args.putFloat(offset, params.backgroundBright);
+        offset += 4;
+
+        // iToneMapStrength：色调映射强度（1=全 ACES 原行为,0=线性直出）
+        args.putFloat(offset, params.toneMapStrength);
+        offset += 4;
+
+        // iDiskHalfThickness：盘半厚基准（Rs 倍数,原硬编码 0.5·Rs;垂直密度/厚度/尘埃层随动）
+        args.putFloat(offset, params.diskHalfThicknessRs);
+        offset += 4;
+
+        // （参数经描述符集读取,无需命令提交;主机写入即时可见,VMA 分配为 HOST_COHERENT）
     }
 
     /**

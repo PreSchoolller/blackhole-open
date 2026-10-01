@@ -64,6 +64,8 @@ public class DescAllocator {
         descLimits.put(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, (int)Math.min(maxDescs, Integer.toUnsignedLong(limits.maxDescriptorSetUniformBuffers())));
         descLimits.put(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, (int)Math.min(maxDescs, Integer.toUnsignedLong(limits.maxDescriptorSetSamplers())));
         descLimits.put(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (int)Math.min(maxDescs, Integer.toUnsignedLong(limits.maxDescriptorSetStorageBuffers())));
+        // 存储图（NPGS 原版后处理链 compute imageStore 写入）
+        descLimits.put(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, (int)Math.min(maxDescs, Integer.toUnsignedLong(limits.maxDescriptorSetStorageImages())));
         return descLimits;
     }
 

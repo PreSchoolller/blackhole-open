@@ -3,6 +3,7 @@ package vulkanb.eng.scene;
 import org.joml.Matrix3f;
 import org.joml.Quaternionf;
 import org.joml.Vector3f;
+import vulkanb.eng.AppLog;
 
 /**
  * 克尔时空测地线积分器 —— Kerr-Schild 笛卡尔坐标,几何单位 G = c = 1。
@@ -101,6 +102,21 @@ public class GeodesicIntegrator {
     private final double[][] uStages = new double[4][4];
     /** 位置临时向量 */
     private final double[] xTmp = new double[4];
+    /** NPGS GetIntermediateSign 穿越检测状态：宇宙符号镜像 + 上子步位置 + GUI 同步标记 */
+    private double universeSign = 1.0;
+    private double lastReportedSign = 1.0;
+    private boolean universeSignDirty;
+    private final double[] prevStepX = new double[4];
+    /** KS 补丁状态（NPGS g_isOutgoing）：false = ingoing 片，true = outgoing 片——
+     *  CheckAndSwitchCoords 每子步维护，随 UBO iCamDataCoordisOutgoing 上传给 shader */
+    private boolean outgoingPatch = false;
+    /** 视界护栏（r<minRadius 暂停推进）：坠落演出开时为真；关演出穿越时由外部放开 */
+    private boolean horizonGuard = true;
+
+    /** 视界护栏开关（坠落演出关闭时设 false，允许积分穿过视界） */
+    public void setHorizonGuard(boolean horizonGuard) {
+        this.horizonGuard = horizonGuard;
+    }
 
     /**
      * 用当前位置/视线方向/初速度初始化测地线状态。
@@ -114,6 +130,11 @@ public class GeodesicIntegrator {
         posX[1] = positionRs.y;
         posX[2] = positionRs.z;
         posX[3] = 0.0;
+        // 重置宇宙符号镜像与 KS 补丁（新轨道从正宇宙 ingoing 片起算；坠落演出传送复用此路径）
+        universeSign = 1.0;
+        lastReportedSign = 1.0;
+        universeSignDirty = true;
+        outgoingPatch = false;
         double v = Math.min(Math.max(v0c, 0.01), 0.99);
         velU[0] = dirUnit.x * v;
         velU[1] = dirUnit.y * v;
@@ -193,18 +214,54 @@ public class GeodesicIntegrator {
             return;
         }
         double r = radius();
-        if (r < minRadius()) {
-            return;   // 奇点/视界保护:暂停推进
+        // 奇点/视界保护:暂停推进（坠落演出关闭时可穿越——continue 保留数值实验路径，
+        // NPGS 同样允许积分穿过视界（KS ingoing 坐标在视界处正则））
+        if (r < minRadius() && horizonGuard) {
+            return;
         }
         double totalDtau = (diffTimeMillis / 1000.0) * timeScale;
-        double dtauMax = 0.05 * Math.pow(Math.max(r, 1.0), 1.5);
+        // 步长随 r 一路细分(原来在视界内钳在 0.05):环奇邻域 Γ ~ (a²−ρ²)^{−3/2} 量级巨大,
+        // 粗步长会数值注入能量——表现为贴环弹射到 10⁷+ Rs 或直接 NaN。细分后游戏内表现为
+        // 喉道附近的时间放缓(MAX_SUBSTEPS 封顶),对穿越操控反而友好
+        double dtauMax = 0.05 * Math.pow(r, 1.5);
         int substeps = (int) Math.ceil(totalDtau / dtauMax);
         substeps = Math.min(Math.max(substeps, 1), MAX_SUBSTEPS);
         double h = totalDtau / substeps;
         for (int i = 0; i < substeps; i++) {
             rk4Step(h);
+            if (!isStateFinite()) {
+                // 撞环奇点等数值发散：NaN 相机数据会让 shader 每条光线跑满 MaxStep
+                // （单帧数秒的全黑巨卡），立即拉回安全轨道不让 NaN 出积分器
+                recoverFromBlowup();
+                break;
+            }
         }
         updateBetaGamma();
+    }
+
+    /** 状态有限性检查（位置/四速度任一 NaN/Inf 即发散） */
+    private boolean isStateFinite() {
+        for (int i = 0; i < 4; i++) {
+            if (!Double.isFinite(posX[i]) || !Double.isFinite(velU[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** 发散恢复：重置到 5Rs 圆轨道（正宇宙 ingoing 片），标架以世界轴重建 */
+    private void recoverFromBlowup() {
+        AppLog.warn("测地积分数值发散（环奇点邻域），已重置到 5Rs 圆轨道");
+        posX[0] = 5.0;
+        posX[1] = 0.0;
+        posX[2] = 0.0;
+        posX[3] = 0.0;
+        universeSign = 1.0;
+        lastReportedSign = 1.0;
+        universeSignDirty = true;
+        outgoingPatch = false;
+        initializeCircularOrbit();
+        initializeTetrad(new Vector3f(1, 0, 0), new Vector3f(0, 1, 0), new Vector3f(0, 0, 1));
     }
 
     /** 沿给定世界方向施加推力(改变四速度空间分量后重新投影约束) */
@@ -227,12 +284,28 @@ public class GeodesicIntegrator {
 
     /** 退出测地模式:停用并恢复静态观测者(β=0、γ=1,着色器退化为原行为) */
     public void deactivate() {
+        boolean wasWeird = universeSign != 1.0 || outgoingPatch
+                || Math.sqrt(posX[0] * posX[0] + posX[1] * posX[1] + posX[2] * posX[2]) < 1.5;
         active = false;
         tetradActive = false;
         fallPhase = 0;
         horizonFade = 0.0f;
         beta.set(0.0f, 0.0f, 0.0f);
         gamma = 1.0f;
+        // 静态观者回到正宇宙侧 ingoing 片（GUI 复选框同步复位）
+        universeSign = 1.0;
+        lastReportedSign = 1.0;
+        universeSignDirty = true;
+        outgoingPatch = false;
+        // 从奇异区（视界内/反宇宙侧/异常补丁）退出时弹出到 5Rs 安全位置——
+        // 静态观者留在那些区域只会得到黑屏（相机位置与补丁语义不再自洽）
+        if (wasWeird) {
+            posX[0] = 5.0;
+            posX[1] = 0.0;
+            posX[2] = 0.0;
+            posX[3] = 0.0;
+            AppLog.info("已从非正常时空区退出测地模式，弹出到 5Rs 安全位置");
+        }
     }
 
     /** 是否处于视界坠落演出中(演出期间积分器冻结、画面由 iFade 接管) */
@@ -411,26 +484,30 @@ public class GeodesicIntegrator {
      *  l_μ 时间分量为正:该符号下的切片允许下落轨迹平滑穿越视界
      *  (若取 l_i = -x/r 则为白洞出射片,下落粒子会被弹射到无穷远——已实测验证)。
      *  a≠0 时 f/l 用与 kerr.frag ComputeGeometryScalars 严格同式的 Kerr 形式(自旋轴 Y)。 */
+    /** KS 度规（当前补丁状态：universeSign/outgoingPatch） */
     private void computeMetric(double[] x, double[][] gDn, double[][] gUp) {
-        double r;
-        double lx, ly, lz;
-        double f;
-        if (spinA == 0.0) {
-            r = Math.sqrt(x[0] * x[0] + x[1] * x[1] + x[2] * x[2]);
-            lx = x[0] / r;
-            ly = x[1] / r;
-            lz = x[2] / r;
-            f = 2 * M / r;
-        } else {
-            r = ksRadius(x[0], x[1], x[2]);
-            double r2 = r * r;
-            double invR2A2 = 1.0 / (r2 + spinA * spinA);
-            lx = (r * x[0] - spinA * x[2]) * invR2A2;
-            ly = x[1] / r;
-            lz = (r * x[2] + spinA * x[0]) * invR2A2;
-            double y2 = x[1] * x[1];
-            f = (2.0 * M * r2 * r) / Math.max(1e-20, r2 * r2 + spinA * spinA * y2);
-        }
+        computeMetric(x, gDn, gUp, universeSign, outgoingPatch);
+    }
+
+    /**
+     * KS 度规（带符号 r + 补丁方向；NPGS ComputeMetric 移植）。
+     * signR=-1 = 反宇宙侧（r 取负根）；isOut=true = outgoing 片（类空 null 方向反转）。
+     * a=0 时公式自然退化为 Schwarzschild（r²=|x|², f=2M/r），不再分支。
+     */
+    private void computeMetric(double[] x, double[][] gDn, double[][] gUp, double signR, boolean isOut) {
+        double a2 = spinA * spinA;
+        double u = x[0] * x[0] + x[1] * x[1] + x[2] * x[2] - a2;
+        double v = 4.0 * a2 * x[1] * x[1];
+        double s = Math.sqrt(u * u + v);
+        double r2 = (u >= 0.0) ? 0.5 * (u + s) : (2.0 * a2 * x[1] * x[1]) / Math.max(1e-20, s - u);
+        double r = signR * Math.sqrt(Math.max(r2, 0.0));
+        double dir = isOut ? -1.0 : 1.0;
+        double inv = 1.0 / Math.max(1e-20, r2 + a2);
+        double lx = (dir * r * x[0] - spinA * x[2]) * inv;
+        double ly = (dir * x[1]) / r;
+        double lz = (dir * r * x[2] + spinA * x[0]) * inv;
+        double y2 = x[1] * x[1];
+        double f = (2.0 * M * r2 * r) / Math.max(1e-20, r2 * r2 + a2 * y2);
         double lt = 1.0;
         gDn[0][0] = 1 + f * lx * lx;
         gDn[0][1] = f * lx * ly;
@@ -468,33 +545,121 @@ public class GeodesicIntegrator {
         gUp[3][2] = gUp[2][3];
     }
 
-    /** 克氏符 Γ^μ_νσ = ½ g^μρ(∂_ν g_ρσ + ∂_σ g_ρν − ∂_ρ g_νσ),∂g 中心差分 */
-    private void computeChristoffel(double[] x) {
-        computeMetric(x, gDown, gUp);
-        for (int i = 0; i < 3; i++) {
-            double[] xp = x.clone();
-            double[] xm = x.clone();
-            xp[i] += H;
-            xm[i] -= H;
-            double[][] gp = new double[4][4];
-            double[][] gm = new double[4][4];
-            double[][] gupThrow = new double[4][4];
-            computeMetric(xp, gp, gupThrow);
-            computeMetric(xm, gm, gupThrow);
-            for (int a = 0; a < 4; a++) {
-                for (int b = 0; b < 4; b++) {
-                    dG[i][a][b] = (gp[a][b] - gm[a][b]) / (2 * H);
+    /** 数值差分计算 Christoffel 符号（signR：本子步宇宙符号，度规按其取符号） */
+    /**
+     * 解析计算 KS 度规克氏符（NPGS ComputeChristoffel 逐字移植，本积分器 Q=0、fade=1）。
+     * 替换此前的中心差分版：差分在环奇点邻域（r→0,y→0）采样跨奇点结构产生垃圾加速度
+     * （实测极向穿越在 y≈0 回弹、位置暴涨至数千 Rs）；解析式用 Y=y/r 恒等式严格
+     * 消去 0/0（见 dl_down[k][1] 的化简），NPGS 注释"极其稳定且高效"。
+     */
+    private void computeChristoffel(double[] x, double signR) {
+        double px = x[0], py = x[1], pz = x[2];
+        double a2 = spinA * spinA;
+        double R2 = px * px + py * py + pz * pz;
+        double uVal = R2 - a2;
+        double v = 4.0 * a2 * py * py;
+
+        // S：导数分母核心项，限制最小值防环奇点除零
+        double s = Math.max(1e-20, Math.sqrt(uVal * uVal + v));
+        double r2 = (uVal >= 0.0) ? 0.5 * (uVal + s) : (2.0 * a2 * py * py) / Math.max(1e-20, s - uVal);
+        double r = signR * Math.sqrt(Math.max(r2, 0.0));
+
+        // Y = y/r：r→0 时由 r2−u = a²y²/r² 恒等式改写，消除 0/0
+        double yOverR = 0.0;
+        if (Math.abs(r) > 1e-10) {
+            yOverR = py / r;
+        } else if (Math.abs(spinA) > 1e-20) {
+            double signY = (py >= 0.0) ? 1.0 : -1.0;
+            yOverR = signY * signR * Math.sqrt(Math.max(0.0, r2 - uVal)) / Math.abs(spinA);
+        }
+
+        // 1. r 的空间偏导数（∂_t r = 0）
+        double[] dr = {0.0, (yOverR * (r2 + a2)) / s, 0.0, 0.0};
+        dr[0] = (r * px) / s;
+        dr[2] = (r * pz) / s;
+
+        // 2. f = 2M·r³/(r⁴+a²y²) 及其空间偏导数
+        double bigD = r2 * r2 + a2 * py * py;
+        double dInv = 1.0 / Math.max(1e-20, bigD);
+        double f = 2.0 * M * r2 * r * dInv;
+        double[] df = new double[4];
+        for (int k = 0; k < 3; k++) {
+            double dN = 3.0 * r2 * dr[k];
+            double dD = 4.0 * r * r2 * dr[k];
+            if (k == 1) {
+                dD += 2.0 * a2 * py;
+            }
+            df[k] = (dN * bigD - 2.0 * M * r2 * r * dD) * dInv * dInv;
+        }
+
+        // 3. 类光矢量 l_down（含补丁方向）及其空间偏导数
+        double dir = outgoingPatch ? -1.0 : 1.0;
+        double invR2A2 = 1.0 / Math.max(1e-20, r2 + a2);
+        double[] lDown = {(dir * r * px - spinA * pz) * invR2A2, dir * yOverR,
+                (dir * r * pz + spinA * px) * invR2A2, 1.0};
+        double[][] dlDown = new double[3][4];
+        for (int k = 0; k < 3; k++) {
+            double dinv = -invR2A2 * invR2A2 * 2.0 * r * dr[k];
+            double term0 = dir * px * dr[k];
+            if (k == 0) {
+                term0 += dir * r;
+            }
+            if (k == 2) {
+                term0 -= spinA;
+            }
+            dlDown[k][0] = term0 * invR2A2 + (dir * r * px - spinA * pz) * dinv;
+            // ∂_k l_y：Kerr–Schild 恒等式化简，极大消去 0/0
+            if (k == 0) {
+                dlDown[k][1] = -dir * yOverR * px / s;
+            } else if (k == 1) {
+                dlDown[k][1] = dir * r * (1.0 - yOverR * yOverR) / s;
+            } else {
+                dlDown[k][1] = -dir * yOverR * pz / s;
+            }
+            double term2 = dir * pz * dr[k];
+            if (k == 2) {
+                term2 += dir * r;
+            }
+            if (k == 0) {
+                term2 += spinA;
+            }
+            dlDown[k][2] = term2 * invR2A2 + (dir * r * pz + spinA * px) * dinv;
+            dlDown[k][3] = 0.0;
+        }
+
+        // 4. 逆度规 g^μν = η^μν − f·l^μ l^ν（l^t = −1）
+        double[][] gUpLocal = new double[4][4];
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 4; j++) {
+                double li = (i == 3) ? -1.0 : lDown[i];
+                double lj = (j == 3) ? -1.0 : lDown[j];
+                gUpLocal[i][j] = (i == j ? (i == 3 ? -1.0 : 1.0) : 0.0) - f * li * lj;
+            }
+        }
+
+        // 5. 度规偏导数 ∂_k g_μν（时空平稳，∂_t g = 0——首维按 NPGS 开满 4 槽，
+        //    Γ 组装的 μ/ν/ρ 遍历含时间指标 3，[3] 槽保持 0 不写）
+        double[][][] dgDown = new double[4][4][4];
+        for (int k = 0; k < 3; k++) {
+            for (int mu = 0; mu < 4; mu++) {
+                for (int nu = 0; nu < 4; nu++) {
+                    dgDown[k][mu][nu] = df[k] * lDown[mu] * lDown[nu]
+                            + f * dlDown[k][mu] * lDown[nu]
+                            + f * lDown[mu] * dlDown[k][nu];
                 }
             }
         }
-        for (int mu = 0; mu < 4; mu++) {
-            for (int nu = 0; nu < 4; nu++) {
-                for (int sig = 0; sig < 4; sig++) {
+
+        // 6. Γ^λ_μν = ½ g^λρ(∂_μ g_ρν + ∂_ν g_ρμ − ∂_ρ g_μν)
+        for (int lambda = 0; lambda < 4; lambda++) {
+            for (int mu = 0; mu < 4; mu++) {
+                for (int nu = 0; nu < 4; nu++) {
                     double sum = 0;
                     for (int rho = 0; rho < 4; rho++) {
-                        sum += gUp[mu][rho] * (dG[nu][rho][sig] + dG[sig][rho][nu] - dG[rho][nu][sig]);
+                        sum += 0.5 * gUpLocal[lambda][rho]
+                                * (dgDown[mu][rho][nu] + dgDown[nu][rho][mu] - dgDown[rho][mu][nu]);
                     }
-                    gammaSyms[mu][nu][sig] = 0.5 * sum;
+                    gammaSyms[lambda][mu][nu] = sum;
                 }
             }
         }
@@ -504,8 +669,9 @@ public class GeodesicIntegrator {
      * 联合状态导数(16 维):dU/dτ = −Γ(U,U),de_a/dτ = −Γ(U,e_a)(平行输运方程;
      * 对时间腿 U 而言该式即测地线方程,故四条腿用同一个 Γ 一次性推进)。
      */
-    private void derivQ(double[] x, double[] qv, double[] out) {
-        computeChristoffel(x);
+    /** 测地线 + 标架平行输运右端项（signR：本 RK4 子步的宇宙符号——NPGS 逐子步演化） */
+    private void derivQ(double[] x, double[] qv, double[] out, double signR) {
+        computeChristoffel(x, signR);
         for (int mu = 0; mu < 4; mu++) {
             double sum = 0;
             for (int nu = 0; nu < 4; nu++) {
@@ -534,12 +700,15 @@ public class GeodesicIntegrator {
     /** 单个 RK4 子步(X 与 q=[U,e1,e2,e3] 联立),随后做 U 约束投影与标架重正交。
      *  注意 X 方程的斜率是各阶段的 U 值(dX/dτ=U),与 dQ/dτ=derivQ 分开保存。 */
     private void rk4Step(double h) {
+        // NPGS StepRK4：每子步先做补丁换系判定（ingoing/outgoing 发散抑制），再演化
+        checkAndSwitchCoords();
+        System.arraycopy(posX, 0, prevStepX, 0, 4);
         System.arraycopy(velU, 0, qNow, 0, 4);
         for (int a = 0; a < 3; a++) {
             System.arraycopy(tetrad[a], 0, qNow, 4 + 4 * a, 4);
         }
         // ---- 阶段 1 ----
-        derivQ(posX, qNow, kQ[0]);
+        derivQ(posX, qNow, kQ[0], universeSign);
         System.arraycopy(qNow, 0, uStages[0], 0, 4);
         for (int i = 0; i < 4; i++) {
             xTmp[i] = posX[i] + 0.5 * h * uStages[0][i];
@@ -548,7 +717,7 @@ public class GeodesicIntegrator {
             qTmp[i] = qNow[i] + 0.5 * h * kQ[0][i];
         }
         // ---- 阶段 2 ----
-        derivQ(xTmp, qTmp, kQ[1]);
+        derivQ(xTmp, qTmp, kQ[1], intermediateUniverseSign(prevStepX, xTmp, universeSign));
         System.arraycopy(qTmp, 0, uStages[1], 0, 4);
         for (int i = 0; i < 4; i++) {
             xTmp[i] = posX[i] + 0.5 * h * uStages[1][i];
@@ -557,7 +726,7 @@ public class GeodesicIntegrator {
             qTmp[i] = qNow[i] + 0.5 * h * kQ[1][i];
         }
         // ---- 阶段 3 ----
-        derivQ(xTmp, qTmp, kQ[2]);
+        derivQ(xTmp, qTmp, kQ[2], intermediateUniverseSign(prevStepX, xTmp, universeSign));
         System.arraycopy(qTmp, 0, uStages[2], 0, 4);
         for (int i = 0; i < 4; i++) {
             xTmp[i] = posX[i] + h * uStages[2][i];
@@ -566,7 +735,7 @@ public class GeodesicIntegrator {
             qTmp[i] = qNow[i] + h * kQ[2][i];
         }
         // ---- 阶段 4 ----
-        derivQ(xTmp, qTmp, kQ[3]);
+        derivQ(xTmp, qTmp, kQ[3], intermediateUniverseSign(prevStepX, xTmp, universeSign));
         System.arraycopy(qTmp, 0, uStages[3], 0, 4);
         // ---- 组合 ----
         for (int i = 0; i < 4; i++) {
@@ -582,6 +751,183 @@ public class GeodesicIntegrator {
         }
         projectConstraint();
         renormalizeTetrad();
+        // NPGS GetIntermediateSign：本子步穿越检测（Y 变号 + 交点 ρ<|a| → 翻转宇宙符号）
+        double evolvedSign = intermediateUniverseSign(prevStepX, posX, universeSign);
+        if (evolvedSign != universeSign) {
+            double t = prevStepX[1] / (prevStepX[1] - posX[1]);
+            double crossX = prevStepX[0] + t * (posX[0] - prevStepX[0]);
+            double crossZ = prevStepX[2] + t * (posX[2] - prevStepX[2]);
+            AppLog.infof("宇宙符号 → %.0f（穿越点 ρ=%.3f, y=%.3f→%.3f）",
+                    evolvedSign, Math.sqrt(crossX * crossX + crossZ * crossZ), prevStepX[1], posX[1]);
+            universeSign = evolvedSign;
+            lastReportedSign = universeSign;
+            universeSignDirty = true;
+        }
+    }
+
+    /** 向量指标升降 V_μ = g_μν V^ν（NPGS ChangeIndex 移植） */
+    private void changeIndex(double[] v, double[] out, double[][] g) {
+        for (int i = 0; i < 4; i++) {
+            double sum = 0;
+            for (int j = 0; j < 4; j++) {
+                sum += g[i][j] * v[j];
+            }
+            out[i] = sum;
+        }
+    }
+
+    /**
+     * KS 补丁间坐标变换（NPGS TransformKS 逐字移植，含 Kerr–Newman 项；本积分器 Q=0）。
+     * 原地变换坐标 X 与（协变）动量/标架 P：ingoing→outgoing 或反向（outToIn 取当前补丁），
+     * 含 F_r/g_r 对数/反正切修正与绕自旋轴的坐标旋转。穿越视界后的稳定推进依赖此换系。
+     */
+    private void transformKS(double[] X, double[] P, double signR, boolean outToIn) {
+        final double EPS = 1e-16;
+        double x = X[0], y = X[1], z = X[2], t = X[3];
+        double px = P[0], py = P[1], pz = P[2], pt = P[3];
+        double a = spinA, a2 = a * a, M2 = M * M;
+        double R2 = x * x + y * y + z * z;
+        double u = R2 - a2;
+        double v = 4.0 * a2 * y * y;
+        double r2 = (u >= 0.0) ? 0.5 * (u + Math.sqrt(u * u + v))
+                : 0.5 * v / Math.max(1e-20, Math.sqrt(u * u + v) - u);
+        double r = signR * Math.sqrt(Math.max(r2, 0.0));
+        double Delta = r * r - 2.0 * M * r + a2;
+        double safeDelta = (Delta >= 0 ? 1 : -1) * Math.max(Math.abs(Delta), EPS);
+        double D = r * r * r * r + a2 * y * y;
+        double safeD = Math.max(D, 1e-12);
+        double gradRx = (r * r * r * x) / safeD;
+        double gradRy = (r * (r * r + a2) * y) / safeD;
+        double gradRz = (r * r * r * z) / safeD;
+        double deltaDisc = M2 - a2;
+        double fr = 0.0, gr = 0.0;
+        double absDeltaSafe = Math.max(Math.abs(Delta), EPS);
+        if (deltaDisc > EPS) {
+            double k = Math.sqrt(deltaDisc);
+            double frac = Math.abs(r - (M + k)) / Math.max(Math.abs(r - (M - k)), EPS);
+            fr = 2.0 * M * Math.log(absDeltaSafe) + ((2.0 * M2) / k) * Math.log(Math.max(frac, EPS));
+            gr = (a / k) * Math.log(Math.max(frac, EPS));
+        } else if (deltaDisc < -EPS) {
+            double k = Math.sqrt(-deltaDisc);
+            double atanArg = Math.atan((r - M) / k);
+            fr = 2.0 * M * Math.log(absDeltaSafe) + (2.0 * (2.0 * M2) / k) * atanArg;
+            gr = (2.0 * a / k) * atanArg;
+        } else {
+            double rM = r - M;
+            double safeRM = (rM >= 0 ? 1 : -1) * Math.max(Math.abs(rM), EPS);
+            fr = 4.0 * M * Math.log(Math.max(Math.abs(rM), EPS)) - 2.0 * (2.0 * M2) / safeRM;
+            gr = -2.0 * a / safeRM;
+        }
+        gr += 2.0 * Math.atan2(a, r);
+        double fPrime = 2.0 * (2.0 * M * r) / safeDelta;
+        double gPrime = 2.0 * a / safeDelta - 2.0 * a / (r * r + a * a);
+        double ly = z * px - x * pz;
+        double kp = fPrime * pt + gPrime * ly;
+        double dir = outToIn ? -1.0 : 1.0;
+        double angle = -dir * gr;
+        double timeShift = -dir * fr;
+        double pTildeX = px + dir * gradRx * kp;
+        double pTildeY = py + dir * gradRy * kp;
+        double pTildeZ = pz + dir * gradRz * kp;
+        double cosA = Math.cos(angle), sinA = Math.sin(angle);
+        X[0] = x * cosA + z * sinA;
+        X[1] = y;
+        X[2] = z * cosA - x * sinA;
+        X[3] = t + timeShift;
+        P[0] = pTildeZ * sinA + pTildeX * cosA;
+        P[1] = pTildeY;
+        P[2] = -pTildeX * sinA + pTildeZ * cosA;
+        P[3] = pt;
+    }
+
+    /**
+     * 补丁换系判定（NPGS CheckAndSwitchCoords 逐字移植）：把全部状态（位置/四速度/三标架腿）
+     * 试变换到另一 KS 补丁，比较四速度协变分量之和（发散度），当前系发散超过 2×目标系
+     * 即确认换系（视界穿越处 ingoing 片发散、outgoing 片平滑，反之亦然）。
+     * 只翻补丁标志，不改宇宙符号（signR 由 GetIntermediateSign 单独演化）。
+     */
+    private void checkAndSwitchCoords() {
+        computeMetric(posX, gDown, gUp, universeSign, outgoingPatch);
+        double currentSum = Math.abs(velU[0]) + Math.abs(velU[1]) + Math.abs(velU[2]) + Math.abs(velU[3]);
+
+        double[] testU = new double[4];
+        changeIndex(velU, testU, gDown);
+        double[][] testE = new double[3][4];
+        for (int k = 0; k < 3; k++) {
+            changeIndex(tetrad[k], testE[k], gDown);
+        }
+
+        double[] testPos = posX.clone();
+        transformKS(testPos, testU, universeSign, outgoingPatch);
+        for (int k = 0; k < 3; k++) {
+            double[] dummyX = posX.clone();
+            transformKS(dummyX, testE[k], universeSign, outgoingPatch);
+        }
+
+        double[][] testGDn = new double[4][4];
+        double[][] testGUp = new double[4][4];
+        computeMetric(testPos, testGDn, testGUp, universeSign, !outgoingPatch);
+        double[] raised = new double[4];
+        changeIndex(testU, raised, testGUp);
+        System.arraycopy(raised, 0, testU, 0, 4);
+        for (int k = 0; k < 3; k++) {
+            changeIndex(testE[k], raised, testGUp);
+            System.arraycopy(raised, 0, testE[k], 0, 4);
+        }
+
+        double testSum = Math.abs(testU[0]) + Math.abs(testU[1]) + Math.abs(testU[2]) + Math.abs(testU[3]);
+        if (currentSum > 2.0 * testSum) {
+            System.arraycopy(testPos, 0, posX, 0, 4);
+            System.arraycopy(testU, 0, velU, 0, 4);
+            for (int k = 0; k < 3; k++) {
+                System.arraycopy(testE[k], 0, tetrad[k], 0, 4);
+            }
+            outgoingPatch = !outgoingPatch;
+            AppLog.infof("KS 换系 → %s（协变速度和 %.3g → %.3g）",
+                    outgoingPatch ? "outgoing" : "ingoing", currentSum, testSum);
+        }
+    }
+
+    /** 当前相机/标架数据所在 KS 补丁（true = outgoing 片；UBO iCamDataCoordisOutgoing 数据源） */
+    public boolean isOutgoingPatch() {
+        return outgoingPatch;
+    }
+
+    /**
+     * NPGS GetIntermediateSign 逐字移植：相邻两位置 Y（自旋轴）变号时插值赤道面穿越点，
+     * 交点柱面半径 ρ < |a|（从环内侧穿过 = 虫洞喉道）即翻转宇宙符号。
+     * 与 NPGS StepRK4 相同，按积分子步检查（帧内多子步可多次翻转）。
+     */
+    private double intermediateUniverseSign(double[] startX, double[] curX, double sign) {
+        if (startX[1] * curX[1] < 0.0) {
+            double t = startX[1] / (startX[1] - curX[1]);
+            double mixX = startX[0] + t * (curX[0] - startX[0]);
+            double mixZ = startX[2] + t * (curX[2] - startX[2]);
+            if (Math.sqrt(mixX * mixX + mixZ * mixZ) < Math.abs(spinA)) {
+                return -sign;
+            }
+        }
+        return sign;
+    }
+
+    /**
+     * 同步 GUI/权威侧的宇宙符号到积分器镜像（用户手动改值后下一帧积分生效）。
+     * 外部改值即作废穿越跟踪的连续性假设——镜像直接替换（下子步重新以新符号起算）。
+     */
+    public void syncUniverseSign(double sign) {
+        universeSign = sign;
+        lastReportedSign = sign;
+        universeSignDirty = false;
+    }
+
+    /** 积分器镜像中的宇宙符号（穿越翻转后与帧首值不同） */
+    public double getUniverseSign() {
+        return universeSign;
+    }
+
+    /** 自上次 sync 以来穿越翻转是否改变了符号（NpgsRender 据此写回 KerrParams/GUI） */
+    public boolean isUniverseSignDirty() {
+        return universeSignDirty;
     }
 
     /**

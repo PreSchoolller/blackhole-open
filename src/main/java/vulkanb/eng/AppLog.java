@@ -42,4 +42,11 @@ public final class AppLog {
             Logger.info(String.format(format, args));
         }
     }
+
+    /** 输出一条受开关控制的警告级应用消息（数值发散等异常恢复） */
+    public static void warn(String msg) {
+        if (verbose) {
+            Logger.warn(msg);
+        }
+    }
 }

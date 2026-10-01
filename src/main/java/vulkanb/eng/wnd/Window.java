@@ -1,10 +1,6 @@
 package vulkanb.eng.wnd;
 
-import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
-
-import java.nio.FloatBuffer;
-import java.nio.IntBuffer;
 
 import static org.lwjgl.glfw.Callbacks.glfwFreeCallbacks;
 import static org.lwjgl.glfw.GLFW.*;
@@ -32,9 +28,9 @@ public class Window {
     private final KeyboardInput keyboardInput;
     /** 鼠标输入处理器 */
     private final MouseInput mouseInput;
-    /** 帧缓冲高（像素；Retina/高 DPI 下为逻辑尺寸 × contentScale，随 framebuffer 回调更新） */
+    /** 窗口高度（可能随窗口大小变化而更新） */
     private int height;
-    /** 帧缓冲宽（像素） */
+    /** 窗口宽度 */
     private int width;
     /** 是否需要重建渲染管线（窗口大小变化时设置） */
     private boolean resizeNeeded = false;
@@ -73,18 +69,6 @@ public class Window {
         handle = glfwCreateWindow(width, height, title, MemoryUtil.NULL, MemoryUtil.NULL);
         if (handle == MemoryUtil.NULL) {
             throw new RuntimeException("Failed to create the GLFW window");
-        }
-
-        // 同步真实帧缓冲尺寸：eng.properties 的值只是创建请求（screen coordinates，
-        // macOS 会按屏幕钳制；Retina 下帧缓冲还会 ×contentScale）。首个 framebuffer
-        // 变化发生在下方回调注册之前，若不同步一次，width/height 将停留在请求值，
-        // 表现为遥测面板 Resolution 冻结、与真实渲染分辨率不符
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            IntBuffer fbW = stack.mallocInt(1);
-            IntBuffer fbH = stack.mallocInt(1);
-            glfwGetFramebufferSize(handle, fbW, fbH);
-            width = fbW.get(0);
-            height = fbH.get(0);
         }
 
         // 注册键盘输入回调
@@ -127,36 +111,6 @@ public class Window {
 
     public int getWidth() {
         return width;
-    }
-
-    /** 窗口逻辑宽（screen coordinates；macOS Retina 下 = 帧缓冲宽 / contentScale） */
-    public int getLogicalWidth() {
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            IntBuffer w = stack.mallocInt(1);
-            IntBuffer h = stack.mallocInt(1);
-            glfwGetWindowSize(handle, w, h);
-            return w.get(0);
-        }
-    }
-
-    /** 窗口逻辑高（screen coordinates） */
-    public int getLogicalHeight() {
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            IntBuffer w = stack.mallocInt(1);
-            IntBuffer h = stack.mallocInt(1);
-            glfwGetWindowSize(handle, w, h);
-            return h.get(0);
-        }
-    }
-
-    /** DPI 内容缩放比（Windows 常为 1.0，macOS Retina 为 2.0） */
-    public float getContentScale() {
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            FloatBuffer sx = stack.mallocFloat(1);
-            FloatBuffer sy = stack.mallocFloat(1);
-            glfwGetWindowContentScale(handle, sx, sy);
-            return sx.get(0);
-        }
     }
 
     /** 检查是否需要重建渲染管线（窗口大小变化时返回 true） */

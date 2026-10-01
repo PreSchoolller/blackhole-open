@@ -44,6 +44,11 @@ public class KerrParams {
     /** iBackgroundBrightmut：背景星空亮度乘数（0=纯黑背景，突出盘本体） */
     public float backgroundBrightmut = EngCfg.getInstance().getKerrBackgroundBrightness();
 
+    /** iDiskScatter：盘前向散射强度——背光项，被盘消光的背景光散射回视线，有方向性，只泛亮剪影（0=关） */
+    public float diskScatter = EngCfg.getInstance().getKerrDiskScatter();
+    /** iDiskAmbient：盘环境光强度——弥散项，全天空辐照×盘密度并入发射，无方向性，冷暗盘区均匀补底（0=关） */
+    public float diskAmbient = EngCfg.getInstance().getKerrDiskAmbient();
+
     // ---- 相对论扩展与显示增强（Phase 2.5 面板补齐） ----
     /** iQ：无量纲电荷 Q*（Kerr–Newman 扩展；影响视界半径/ISCO/度规,a²+Q²>1 为裸奇点） */
     public float qStar = EngCfg.getInstance().getKerrCharge();
@@ -79,6 +84,40 @@ public class KerrParams {
     public float jetSaturation = EngCfg.getInstance().getKerrJetSaturation();
     /** iJetShiftMax：喷流频移钳制上限 */
     public float jetShiftMax = EngCfg.getInstance().getKerrJetShiftMax();
+
+    // ---- NPGS 原版专有（仅 KERR_NPGS 模式消费；移植版无对应代码，KerrRender 忽略并写 0） ----
+    /** iGrid：时空网格 0=关 / 1=GridColor / 2=GridColorSimple（原版独有绘制） */
+    public int gridMode = 0;
+    /** iInWhichUniverse：宇宙变体选层 0..2（SampleBackground 按 %3 选 6 套盒中的一套） */
+    public int universeIndex = 0;
+    /** iUniverseSign：相机所在空间侧（+1 正宇宙 / -1 反宇宙）——每条光线宇宙符号的种子
+     *  （随行进中的赤道穿越翻转逻辑演化）。注意：测地相机穿越虫洞不会自动翻转此值
+     *  （引擎未接线状态跟踪），穿越观察时需在此手动切换 */
+    public float universeSign = 1.0f;
+    /** iWhitehole：最大延拓（1=启用白洞/多宇宙解；配合测地相机穿越内视界观察 II 区） */
+    public boolean whitehole = false;
+    /** iEnableShadowCulling：阴影剔除优化（原版默认 0） */
+    public boolean shadowCulling = false;
+    /** iDEBUG：调试视图 0=关 / 1 / 2 / 3=步数热图 / 4 */
+    public int debugMode = 0;
+    /** iPolarization：偏振输出开关（配合 iPolarizationAngle 偏振片角度） */
+    public boolean polarization = false;
+    /** iPolarizationAngle：偏振片角度 */
+    public float polarizationAngle = 0.0f;
+    /** iDensestarsurfaceR：致密星表面半径（Rs 倍数；0=关，>视界半径即渲染中子星表面——原版独有） */
+    public float densestarRadiusRs = 0.0f;
+    /** iDensestarBlackbodyIntensityExponent：表面温度-黑体颜色指数 */
+    public float densestarBlackbodyExp = 4.0f;
+    /** iDensestarRedShiftColorExponent：表面频移-颜色指数 */
+    public float densestarShiftColorExp = 1.0f;
+    /** iDensestarRedShiftIntensityExponent：表面频移-亮度指数 */
+    public float densestarShiftBrightExp = 4.0f;
+    /** iDensestarBrightmut：表面亮度乘数 */
+    public float densestarBrightmut = 1.0f;
+    /** iUseImageDisk：贴图盘开关（赤道面贴 R.jpg 贴图；仅 KERR_NPGS 模式绑定真纹理） */
+    public boolean useImageDisk = false;
+    /** iImageRotationSpeed：贴图盘整体自转角速度（NPGS 初始值 ≈0.0078） */
+    public float imageRotationSpeed = 0.0076561966f * (3.06f / 3.0f);
 
     /** 盘时间倍率（克尔侧的 TimeRate 镜像；史瓦西侧同名滑条驱动的是测地线相机，互不相干） */
     public float timeScale = EngCfg.getInstance().getKerrTimeScale();

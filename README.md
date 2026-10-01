@@ -53,7 +53,9 @@ window.height=1080
 | `skybox.mountainsSeas` | 山海星空盒开关（false；两模式共用，惰性加载约 130MB 显存，GUI Controls 可切换） |
 | `blackhole.temperature` | 基准温度 K（15000，运行时 NumPad ±） |
 | `blackhole.diskInnerRadius` / `diskOuterRadius` | 盘半径 Rs 倍数（3 / 18） |
-| `kerr.spin` 等 `kerr.*` | 克尔模式初始参数（自旋/吸积率/盘几何/亮度/电荷 Q\*/prepass/噪声 LUT/bloom/喷流等 31 键，完整见 `eng.properties` 注释；GUI 滑条运行时覆盖） |
+| `blackhole.diskScatter` / `kerr.diskScatter` | 盘前向散射（背光项）：被盘消光的背景光散射回视线的比例，有方向性——只泛亮剪影（0.25，0=关；GUI 滑条） |
+| `blackhole.diskAmbient` / `kerr.diskAmbient` | 盘环境光（弥散项）：全天空辐照 × 盘密度并入发射，无方向性——冷暗盘区均匀补底，与背光项拼成完整的单次散射（1.0，0=关；GUI 滑条） |
+| `kerr.spin` 等 `kerr.*` | 克尔模式初始参数（自旋/吸积率/盘几何/亮度/电荷 Q\*/prepass/噪声 LUT/bloom/喷流等 33 键，完整见 `eng.properties` 注释；GUI 滑条运行时覆盖） |
 | `input.mouseSensitivity` 等 | 鼠标/滚转/移动/缩放手感 |
 
 ## 操作
@@ -74,7 +76,7 @@ window.height=1080
 | **P** | 时间暂停 / 恢复（冻结盘动画与测地相机推进，定格观察某一时刻；渲染时间与 TAA 照常累积出清晰静帧，鼠标视角仍可转动） |
 | F1 | 显隐全部 GUI 面板 |
 
-GUI 面板：**Black Hole Telemetry**（只读遥测）/ **Controls**（时空模式切换 + 相机滑条，全模式可见）/ **Kerr Disk**（仅克尔模式：吸积率、盘几何、亮度/不透明度/频移指数等，拖动即生效）/ **Keys**（键位表）。
+GUI 面板：**Black Hole Telemetry**（只读遥测）/ **Controls**（时空模式切换 + 测地相机滑条 + 天空盒，全模式可见）/ **Black Hole**（仅史瓦西模式：温度、盘半径、盘散射背光项/环境光弥散项，拖动即生效）/ **Kerr Disk**（仅克尔模式：吸积率、盘几何、亮度/不透明度/频移指数等，拖动即生效）/ **Keys**（键位表）。
 
 ## 源码结构
 
@@ -84,7 +86,7 @@ src/main/java/vulkanb/
 ├── eng/
 │   ├── EngCfg.java            # 双层配置加载(jar 内默认 + 外部覆盖)
 │   ├── InputController.java   # 按键/鼠标/测地相机推进(渲染帧节拍)
-│   ├── scene/                 # Camera / GeodesicIntegrator(测地积分+标架输运) / KerrParams
+│   ├── scene/                 # Camera / GeodesicIntegrator(测地积分+标架输运) / KerrParams / SchwarzschildParams
 │   └── graph/                 # Render(分发) / BlackHoleRender(史瓦西) / KerrRender(克尔)
 │       ├── gui/               # GuiRender(Vulkan 绘制) / Panels(ImGui 面板构建)
 │       └── vk/                # Vulkan 封装 + ShaderCompiler(运行时 shaderc)

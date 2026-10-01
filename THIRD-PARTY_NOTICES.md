@@ -12,6 +12,11 @@
     Vulkan 动态渲染架构（UBO 参数面、观者四维标架接线、prepass/composite 等）；
   - `resources/textures/skybox/` —— 来自其 `Universe0Skybox` 素材（6×1024²）；
   - `resources/textures/skybox_mountains_seas/` —— 来自其 `Antiverse0Skybox` 素材（6×2048²）；
+  - `resources/shaders/npgs/` 与 `resources/textures/npgs/`（npgs-verbatim 分支）——
+    其 `BlackHole.frag.glsl`/`BlackHole_prepass.frag.glsl`/`BlackHole_composite.frag.glsl`/
+    `BlackHole_common.glsl`/`Bloom.comp.glsl`/`ColorBlend.frag.glsl`/`Common/*.glsl`
+    与 6 套天空盒素材、贴图盘 `textures/npgs/Disk/R.jpg` 的**逐字节未动副本**，
+    由 `NpgsRender` 原样渲染（原版 shader 复刻实验，见 `foragent/npgs_verbatim_plan.md`）；
   - 另：史瓦西管线 `blackhole.frag` 的参考实现为其知乎文章
     《从零开始搓一个黑洞——glsl编程实战》，文章着色器与 NPGS 同源（同作者历史代码）。
 
