@@ -64,7 +64,7 @@ public class KerrRender {
     /** GameArgs UBO 字节数（std140：vec2 + 4×float，struct 尺寸对齐到 16 → 32） */
     private static final int GAME_ARGS_SIZE = 32;
     /** BlackHoleArgs UBO 字节数（mat4 + 8×vec4 + 11×int + 37×float = 384，末尾追加 iNoiseLut
-     *  1 float = 388，std140 结构尺寸对齐 16 → 400；既有字段偏移不受追加影响） */
+     *  / iDiskScatter / iDiskAmbient 3 float = 387，std140 结构尺寸对齐 16 → 400；既有字段偏移不受追加影响） */
     private static final int BH_ARGS_SIZE = 400;
     /** 黑洞质量（太阳质量倍数，人马 A*；GUI 面板与 UBO 打包共用 KerrParams.BH_MASS_SOL） */
     private static final float BH_MASS_SOL = KerrParams.BH_MASS_SOL;
@@ -949,7 +949,7 @@ public class KerrRender {
         // 11 个 int 开关（顺序同声明；可调项读 Scene.kerrParams —— GUI 面板数据源）
         var kp = scene.getKerrParams();
         float spin = kp.spin;
-        bh.putInt(0)      // iCamDataCoordisOutgoing（相机数据在 ingoing 片，与积分器一致）
+        bh.putInt(geodesic.isOutgoingPatch() ? 1 : 0)  // iCamDataCoordisOutgoing（CheckAndSwitchCoords 换系后同步）
           .putInt(0)      // iDEBUG
           .putInt(kp.prepassEnabled ? 2 : 0)  // iPrepass（2=composite 边缘感知合成；0=原路径）
           .putInt(0)      // iWhitehole
@@ -1010,7 +1010,9 @@ public class KerrRender {
           .putFloat(kp.jetShiftMax)              // iJetShiftMax
           .putFloat(histFrameCount[slot] < 2 ? 1.0f
                   : prevViewPerSlot[slot].equals(view) ? 0.06f : 1.0f)  // iBlendWeight（前 2 帧全量覆盖；仅镜头静止时累积，动了即全量重置防拖影）
-          .putFloat(kp.noiseLutEnabled ? 1.0f : 0.0f);           // iNoiseLut（扩展字段@384：噪声哈希查表 A/B 开关）
+          .putFloat(kp.noiseLutEnabled ? 1.0f : 0.0f)            // iNoiseLut（扩展字段@384：噪声哈希查表 A/B 开关）
+          .putFloat(kp.diskScatter)                              // iDiskScatter（扩展字段@388：盘前向散射强度/背光项，0=关）
+          .putFloat(kp.diskAmbient);                             // iDiskAmbient（扩展字段@392：盘环境光强度/弥散项，0=关）
         prevViewPerSlot[slot].set(view);
 
         // ---- prepass UBO：GameArgs 分辨率减半 + iPrepass=1；BlackHoleArgs 字节复制主拷贝后仅改 iPrepass，

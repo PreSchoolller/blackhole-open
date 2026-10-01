@@ -14,6 +14,10 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static vulkanb.utils.Constants.RESOURCES;
 import static vulkanb.utils.Constants.RESOURCES_DIR;
@@ -41,6 +45,9 @@ import static vulkanb.utils.Constants.SHADER_CACHE_DIR;
  */
 public class ShaderCompiler {
 
+    /** #include 指令（仅支持引号相对路径形式，如 #include "Common/X.glsl"） */
+    private static final Pattern INCLUDE_PATTERN = Pattern.compile("^\\s*#include\\s+\"([^\"]+)\".*$", Pattern.MULTILINE);
+
     /** 私有构造：静态工具类 */
     private ShaderCompiler() {
     }
@@ -54,6 +61,19 @@ public class ShaderCompiler {
      * @throws RuntimeException 如果编译失败
      */
     public static byte[] compileShader(String shaderCode, int shaderType) {
+        return compileShader(shaderCode, shaderType, new String[0]);
+    }
+
+    /**
+     * 编译 GLSL 源码为 SPIR-V 字节码（带宏定义变体）。
+     *
+     * @param shaderCode GLSL 源码字符串
+     * @param shaderType Vulkan 着色器阶段标志
+     * @param defines    宏定义列表（"NAME" 或 "NAME=VALUE"）
+     * @return 编译后的 SPIR-V 字节码
+     * @throws RuntimeException 如果编译失败
+     */
+    public static byte[] compileShader(String shaderCode, int shaderType, String... defines) {
         // 源码需编码为堆外 ByteBuffer 直传:LWJGL 绑定对 CharSequence 参数用线程本地
         // MemoryStack 编码,其默认容量仅 64KB,大着色器(如 kerr.frag ~250KB)会
         // OutOfMemoryError("Out of stack space")——改为 memUTF8 堆外分配绕开
@@ -74,6 +94,16 @@ public class ShaderCompiler {
                     Shaderc.shaderc_target_env_vulkan, Shaderc.shaderc_env_version_vulkan_1_0);
             // 源语言：GLSL
             Shaderc.shaderc_compile_options_set_source_language(options, Shaderc.shaderc_source_language_glsl);
+            // 宏定义变体（如 GENERATE_MIPMAP / GAUSS_BLUR）
+            for (String define : defines) {
+                int eq = define.indexOf('=');
+                if (eq < 0) {
+                    Shaderc.shaderc_compile_options_add_macro_definition(options, define, "1");
+                } else {
+                    Shaderc.shaderc_compile_options_add_macro_definition(options,
+                            define.substring(0, eq), define.substring(eq + 1));
+                }
+            }
             // 调试模式：生成调试信息，禁用优化
             if (EngCfg.getInstance().isDebugShaders()) {
                 Shaderc.shaderc_compile_options_set_generate_debug_info(options);
@@ -102,21 +132,25 @@ public class ShaderCompiler {
     }
     /**
      * 将 Vulkan 着色器阶段位转换为 shaderc 着色器类型枚举。
+     * <p>
+     * shaderc 枚举实测值（LWJGL 3.4.3，javap 常量池）：vertex=0, fragment=1,
+     * compute=2, geometry=3, tess_control=4, tess_evaluation=5。
+     * （此前的注释表把 compute 写成 5=tess_evaluation——本项目首个 compute shader
+     * 才触发：local_size_x 被按 tess 阶段语义拒绝。现直接引用 Shaderc 常量。）
      *
      * @param vkStage Vulkan 着色器阶段位（如 VK_SHADER_STAGE_VERTEX_BIT = 0x01）
      * @return shaderc 着色器类型（如 shaderc_glsl_vertex_shader = 0）
      */
     private static int toShadercType(int vkStage) {
         // VK stage bits: VERTEX=0x1, TESS_CTRL=0x2, TESS_EVAL=0x4, GEOMETRY=0x8, FRAGMENT=0x10, COMPUTE=0x20
-        // shaderc types: vertex=0, fragment=1, tess_ctrl=2, geometry=3, tess_eval=4, compute=5
         return switch (vkStage) {
-            case 0x01 -> 0; // VK_VERTEX -> shaderc_glsl_vertex_shader
-            case 0x02 -> 2; // VK_TESS_CTRL -> shaderc_glsl_tesscontrol_shader
-            case 0x04 -> 4; // VK_TESS_EVAL -> shaderc_glsl_tessevaluation_shader
-            case 0x08 -> 3; // VK_GEOMETRY -> shaderc_glsl_geometry_shader
-            case 0x10 -> 1; // VK_FRAGMENT -> shaderc_glsl_fragment_shader
-            case 0x20 -> 5; // VK_COMPUTE -> shaderc_glsl_compute_shader
-            default -> 0;
+            case 0x01 -> Shaderc.shaderc_glsl_vertex_shader;
+            case 0x02 -> Shaderc.shaderc_glsl_tess_control_shader;
+            case 0x04 -> Shaderc.shaderc_glsl_tess_evaluation_shader;
+            case 0x08 -> Shaderc.shaderc_glsl_geometry_shader;
+            case 0x10 -> Shaderc.shaderc_glsl_fragment_shader;
+            case 0x20 -> Shaderc.shaderc_glsl_compute_shader;
+            default -> Shaderc.shaderc_glsl_vertex_shader;
         };
     }
 
@@ -130,11 +164,27 @@ public class ShaderCompiler {
      * @param shaderType    着色器阶段标志
      */
     public static String compileShaderIfChanged(String glsShaderFile, int shaderType) {
+        return compileShaderIfChanged(glsShaderFile, shaderType, new String[0]);
+    }
+
+    /**
+     * 条件编译（带宏定义变体）：同一源文件可按不同 -D 宏编译出多个 spv
+     * （NPGS 的 Bloom.comp.glsl 以 GENERATE_MIPMAP / GAUSS_BLUR 两配置复用）。
+     * 缓存键 = 文件名 + 宏哈希 + 源码哈希；过期清理只清同宏变体。
+     *
+     * @param defines    宏定义列表（如 "GENERATE_MIPMAP"；形如 "NAME=VALUE" 带值）
+     */
+    public static String compileShaderIfChanged(String glsShaderFile, int shaderType, String... defines) {
         try {
-            String shaderCode = extractShaderCode(glsShaderFile);
+            // 先解析 #include 再参与缓存键——被包含文件改动同样触发重编译
+            String shaderCode = resolveIncludes(extractShaderCode(glsShaderFile), glsShaderFile, new HashSet<>());
 
             String filePrefix = glsShaderFile.replaceAll("[/\\\\]", "_");                 // 如 _shaders_blackhole.frag
-            String cachePrefix = filePrefix + "." + sourceHash8(shaderCode);     // 追加源码哈希
+            String definesJoined = String.join("|", defines);
+            // 宏哈希：无宏为空串（缓存命名与既有无宏条目完全一致）；同文件不同宏的变体
+            // 聚在不同哈希前缀下，过期清理互不误伤
+            String definesHash = defines.length == 0 ? "" : "." + sourceHash8(definesJoined);
+            String cachePrefix = filePrefix + definesHash + "." + sourceHash8(shaderCode + "#" + definesJoined);
             File spvFile = new File(SHADER_CACHE_DIR + cachePrefix + ".spv");
 
             if (spvFile.exists()) {
@@ -150,9 +200,9 @@ public class ShaderCompiler {
                     Logger.warn("WARNING: mkdir [{}] failed", spvFile.getParentFile().getAbsolutePath());
                 }
             }
-            byte[] compiledShader = compileShader(shaderCode, shaderType);
+            byte[] compiledShader = compileShader(shaderCode, shaderType, defines);
             Files.write(spvFile.toPath(), compiledShader);
-            cleanupStaleCache(spvFile, filePrefix);
+            cleanupStaleCache(spvFile, filePrefix + definesHash + ".");
             return spvFile.getAbsolutePath();
         } catch (IOException excp) {
             throw new RuntimeException(excp);
@@ -170,6 +220,47 @@ public class ShaderCompiler {
             }
             return new String(shaderCodeStream.readAllBytes());
         }
+    }
+
+    /**
+     * 递归解析 GLSL 源码中的 {@code #include "相对路径"} 指令（shaderc 不处理 include）。
+     * <p>
+     * 路径相对包含者所在目录解析，文件系统与 jar 内资源两种形态通用
+     * （路径形态随 {@link #extractShaderCode} 的约定）；同一文件只内联一次
+     * （include-once 去重，NPGS 的 BlackHole.frag 会经两条路径重复引入
+     * CoordConverter.glsl，不去重将重定义报错）。
+     *
+     * @param shaderCode  当前文件的源码
+     * @param sourceFile  当前文件路径（决定相对基准与去重键）
+     * @param included    已内联文件集合（跨递归共享；调用方传入空集合并含根文件）
+     */
+    private static String resolveIncludes(String shaderCode, String sourceFile, Set<String> included) throws IOException {
+        String baseDir = directoryOf(sourceFile);
+        Matcher matcher = INCLUDE_PATTERN.matcher(shaderCode);
+        StringBuilder out = new StringBuilder(shaderCode.length());
+        int last = 0;
+        while (matcher.find()) {
+            out.append(shaderCode, last, matcher.start());
+            String includePath = baseDir.isEmpty() ? matcher.group(1) : baseDir + "/" + matcher.group(1);
+            if (included.add(normalizeKey(includePath))) {
+                out.append(resolveIncludes(extractShaderCode(includePath), includePath, included));
+            }
+            last = matcher.end();
+        }
+        out.append(shaderCode.substring(last));
+        return out.toString();
+    }
+
+    /** 路径的目录部分（无目录返回空串；统一 '/' 分隔，兼容反斜杠输入） */
+    private static String directoryOf(String path) {
+        String normalized = path.replace('\\', '/');
+        int idx = normalized.lastIndexOf('/');
+        return idx < 0 ? "" : normalized.substring(0, idx);
+    }
+
+    /** include-once 去重键：统一分隔符与大小写（Windows 文件系统大小写不敏感） */
+    private static String normalizeKey(String path) {
+        return path.replace('\\', '/').toLowerCase();
     }
 
     public static boolean compilingInJar(String glsShaderFile) throws IOException {

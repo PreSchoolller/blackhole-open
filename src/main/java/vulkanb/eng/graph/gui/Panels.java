@@ -12,10 +12,10 @@ import org.joml.Vector4f;
 import vulkanb.eng.AppLog;
 import vulkanb.eng.EngCtx;
 import vulkanb.eng.EngCfg;
-import vulkanb.eng.graph.BlackHoleRender;
 import vulkanb.eng.scene.Camera;
 import vulkanb.eng.scene.KerrParams;
 import vulkanb.eng.scene.Scene;
+import vulkanb.eng.scene.SchwarzschildParams;
 import vulkanb.eng.wnd.Window;
 
 import org.joml.Vector3f;
@@ -26,8 +26,12 @@ import org.joml.Vector3f;
  * 面板分工：
  * <ul>
  *   <li><b>Black Hole Telemetry</b>（左上）—— 只读遥测：相机/测地线/渲染/场景</li>
- *   <li><b>Controls</b>（左下，全模式可见）—— 时空模式单选 + Temp + 测地相机滑条</li>
- *   <li><b>Kerr Disk</b>（右上，仅克尔模式）—— {@link KerrParams} 全部可调参数</li>
+ *   <li><b>Controls</b>（左下，全模式可见）—— 时空模式单选（含 NPGS verbatim）+ 测地相机滑条</li>
+ *   <li><b>Black Hole</b>（右上，仅史瓦西模式）—— {@link SchwarzschildParams} 全部可调参数</li>
+ *   <li><b>Kerr Disk</b>（右上，克尔系两模式）—— {@link KerrParams} 共享可调参数
+ *       （移植版专有的三条滑条仅在 KERR 模式显示）</li>
+ *   <li><b>NPGS Orig</b>（右下，仅 KERR_NPGS 原版模式）—— 原版专有参数（时空网格/
+ *       致密星表面/白洞延拓/宇宙选层/贴图盘/偏振/调试视图）</li>
  *   <li><b>Keys</b>（右上角，默认折叠）—— 键位表。注意窗口标题不能与其他面板重名——
  *       ImGui 按标题识别窗口,同名 begin 会把内容追加进同一窗口</li>
  * </ul>
@@ -112,8 +116,14 @@ public class Panels {
             renderOriginIndicator(engCtx);
             renderControlPanel(engCtx);
             renderKeys();
-            if (engCtx.scene().getSpacetime() == Scene.SpacetimeMode.KERR) {
+            var mode = engCtx.scene().getSpacetime();
+            if (mode == Scene.SpacetimeMode.KERR || mode == Scene.SpacetimeMode.KERR_NPGS) {
                 renderKerrPanel(engCtx.scene());
+                if (mode == Scene.SpacetimeMode.KERR_NPGS) {
+                    renderNpgsPanel(engCtx.scene());
+                }
+            } else {
+                renderSchwarzschildPanel(engCtx.scene());
             }
         }
         ImGui.endFrame();
@@ -151,6 +161,25 @@ public class Panels {
         ImGui.separator();
         ImGui.text("Geodesic");
         if (geodesic.isActive()) {
+            // 穿越瞄准读数：穿越点柱面半径 ρ vs 环半径 |a|——ρ 略小于 |a| 处（环缘内侧）
+            // 高速穿越是可行路线；正对环心（ρ→0）反宇宙侧势垒超光速，必被弹回
+            double rho = Math.sqrt(pos.x * pos.x + pos.z * pos.z);
+            double ringA = Math.abs(scene.getKerrParams().spin) * 0.5;
+            ImGui.text(String.format("  rho = %.3f Rs  (ring |a| = %.3f)", rho, ringA));
+            // 预测穿越点：按当前坐标速度线性外推到下一次赤道面穿越（y 变号）的 ρ——
+            // 视界外就能修正瞄准，落点 < |a| 才套住喉道（配合视界内细分步长，环缘内侧
+            // 高速穿越可驻留反宇宙；正穿环心会被势垒弹回）
+            Vector3f uCoord = geodesic.getCoordinateVelocity(new Vector3f());
+            if (Math.abs(uCoord.y) > 1e-4) {
+                double tCross = -pos.y / uCoord.y;
+                if (tCross > 0) {
+                    double predX = pos.x + uCoord.x * tCross;
+                    double predZ = pos.z + uCoord.z * tCross;
+                    double predRho = Math.sqrt(predX * predX + predZ * predZ);
+                    ImGui.text(String.format("  pred rho = %.3f Rs  %s (|a| = %.3f)", predRho,
+                            predRho < ringA ? "INSIDE ring" : "outside ring", ringA));
+                }
+            }
             Vector3f beta = geodesic.getBeta();
             // 希腊字母 β/γ 不在 ImGui 默认字体的字形范围内（显示为 ?），用 ASCII 拼写
             ImGui.text(String.format("  beta = (%.3f, %.3f, %.3f)",
@@ -174,9 +203,8 @@ public class Panels {
         double fps = avgFrameMs > 0 ? 1000.0 / avgFrameMs : 0;
         ImGui.text(String.format("  FPS : %.0f(FrameTime %.1f ms)", fps, avgFrameMs));
         ImGui.text(String.format("  Resolution: %d x %d", window.getWidth(), window.getHeight()));
-        ImGui.text(String.format("  Window: %d x %d pts (scale %.1f)",
-                window.getLogicalWidth(), window.getLogicalHeight(), window.getContentScale()));
-        ImGui.text(String.format("  BaseTemperature: %.0f K(NumPad +/- Adjust)", BlackHoleRender.BaseTemperature));
+        ImGui.text(String.format("  BaseTemperature: %.0f K(NumPad +/- Adjust)",
+                engCtx.scene().getSchwarzschildParams().baseTemperature));
 
         // [场景]
         ImGui.separator();
@@ -204,7 +232,7 @@ public class Panels {
         ImGui.setNextWindowSize(350, 250);
         ImGui.begin("Controls");
 
-        // 时空模式：史瓦西 / 克尔（热切换，下一帧生效；测地模式可跨切换保持）
+        // 时空模式：史瓦西 / 克尔（移植版）/ 克尔·NPGS 原版（热切换，下一帧生效；测地模式可跨切换保持）
         ImGui.text("Spacetime");
         if (ImGui.radioButton("Schwarzschild", scene.getSpacetime() == Scene.SpacetimeMode.SCHWARZSCHILD)) {
             scene.setSpacetime(Scene.SpacetimeMode.SCHWARZSCHILD);
@@ -213,15 +241,15 @@ public class Panels {
         if (ImGui.radioButton("Kerr", scene.getSpacetime() == Scene.SpacetimeMode.KERR)) {
             scene.setSpacetime(Scene.SpacetimeMode.KERR);
         }
+        ImGui.sameLine();
+        if (ImGui.radioButton("NPGS verbatim", scene.getSpacetime() == Scene.SpacetimeMode.KERR_NPGS)) {
+            scene.setSpacetime(Scene.SpacetimeMode.KERR_NPGS);
+        }
 
         // 滑条（与快捷键并行生效；拖动即改，钳制范围与快捷键一致）
+        // Temp/盘半径/盘散射/环境光滑条已迁入 Black Hole 面板（仅史瓦西模式）
         ImGui.separator();
         ImGui.text("Camera / Rendering");
-        float[] temp = {BlackHoleRender.BaseTemperature};
-        if (sliderL("Temp (K)", temp,
-                engCfg.getTemperatureMin(), engCfg.getTemperatureMax(), "%.0f")) {
-            BlackHoleRender.BaseTemperature = temp[0];
-        }
         float[] ts = {(float) geodesic.getTimeScale()};
         if (sliderL("TimeRate", ts, 0.1f, 50.0f, "%.2f")) {
             geodesic.setTimeScale(ts[0]);
@@ -244,11 +272,111 @@ public class Panels {
         if (ImGui.checkbox("Mountains & Seas skybox", mountainsSeas)) {
             scene.setMountainsSeasSkybox(!mountainsSeas);
         }
+        // 视界坠落演出（测地模式 r<1.02Rs 淡出→传送→淡入；关掉后可穿过视界/虫洞喉道，
+        // 观察 NPGS 最大延拓与宇宙符号自动翻转——NPGS Orig 面板 Anti-universe 复选框会跟着跳）
+        boolean fallShow = scene.isHorizonFallEnabled();
+        if (ImGui.checkbox("Horizon fall show", fallShow)) {
+            scene.setHorizonFallEnabled(!fallShow);
+        }
 
         // 应用自定义日志开关（初始值来自配置/命令行,此处运行时切换）
         boolean verbose = AppLog.isVerbose();
         if (ImGui.checkbox("Verbose log", verbose)) {
             AppLog.setVerbose(!verbose);
+        }
+
+        ImGui.end();
+    }
+
+    /**
+     * Black Hole 参数面板 —— 仅史瓦西时空模式渲染（随模式显隐，受 F1 门控；与 Kerr Disk
+     * 面板同位互斥显示）。滑条直写 {@link SchwarzschildParams}，BlackHoleRender 每帧
+     * 打包进参数 UBO，下一帧即生效；Temp 与小键盘 ± 快捷键并行生效。
+     * 盘散射/环境光为单次散射两块（见 foragent/schwarzschild_ubo_panel_plan.md）：
+     * backlight=背光项，有方向性——只泛亮剪影（视线正后方穿透盘的背景光的散射）；
+     * all-sky=弥散项，无方向性——全天空入射光照亮盘物质，冷暗盘区均匀补底。
+     */
+    private void renderSchwarzschildPanel(Scene scene) {
+        SchwarzschildParams sp = scene.getSchwarzschildParams();
+        var engCfg = EngCfg.getInstance();
+        float w = ImGui.getIO().getDisplaySizeX();
+        ImGui.setNextWindowPos(w - 250, 100, ImGuiCond.FirstUseEver);
+        ImGui.setNextWindowSize(400, 640);
+        ImGui.begin("Black Hole");
+
+        ImGui.text("Disk / Display");
+        float[] temp = {sp.baseTemperature};
+        if (sliderL("Temp (K)", temp,
+                engCfg.getTemperatureMin(), engCfg.getTemperatureMax(), "%.0f")) {
+            sp.baseTemperature = temp[0];
+        }
+        // 盘半径（Rs 倍数）；外半径调大会显著增加 raymarch 步数与 TAA 拖影面积（性能骤降）
+        float[] v;
+        v = new float[]{sp.diskInnerRadiusRs};
+        if (sliderL("Disk inner radius", v, 2.0f, 6.0f, "%.1f Rs")) {
+            sp.diskInnerRadiusRs = v[0];
+        }
+        v = new float[]{sp.diskOuterRadiusRs};
+        if (sliderL("Disk outer radius", v, 6.0f, 40.0f, "%.1f Rs")) {
+            sp.diskOuterRadiusRs = v[0];
+        }
+        // 盘半厚（Rs 倍数；调大增加盘内采样步数略降性能,调小为薄盘）
+        v = new float[]{sp.diskHalfThicknessRs};
+        if (sliderL("Disk half-thickness", v, 0.1f, 2.0f, "%.2f Rs")) {
+            sp.diskHalfThicknessRs = v[0];
+        }
+        v = new float[]{sp.diskScatter};
+        if (sliderL("Disk scatter (backlight)", v, 0.0f, 1.0f, "%.2f")) {
+            sp.diskScatter = v[0];
+        }
+        v = new float[]{sp.diskAmbient};
+        if (sliderL("Disk ambient (all-sky)", v, 0.0f, 4.0f, "%.2f")) {
+            sp.diskAmbient = v[0];
+        }
+
+        // 合成与 A/B 实验（参数为 shader/bloomComposite 原硬编码值,默认即原观感）
+        ImGui.separator();
+        ImGui.text("Post / A-B");
+        v = new float[]{sp.exposure};
+        if (sliderL("Exposure", v, 0.5f, 4.0f, "%.2f")) {
+            sp.exposure = v[0];
+        }
+        v = new float[]{sp.shiftMax};
+        if (sliderL("Shift max", v, 1.5f, 4.0f, "%.2f")) {
+            sp.shiftMax = v[0];
+        }
+        v = new float[]{sp.taaTau};
+        if (sliderL("TAA tau (s)", v, 0.05f, 0.6f, "%.2f")) {
+            sp.taaTau = v[0];
+        }
+        v = new float[]{sp.bloomThreshold};
+        if (sliderL("Bloom threshold", v, 0.0f, 2.0f, "%.2f")) {
+            sp.bloomThreshold = v[0];
+        }
+        v = new float[]{sp.bloomMix};
+        if (sliderL("Bloom mix", v, 0.0f, 1.5f, "%.2f")) {
+            sp.bloomMix = v[0];
+        }
+        v = new float[]{sp.bloomMax};
+        if (sliderL("Bloom max", v, 4.0f, 24.0f, "%.1f")) {
+            sp.bloomMax = v[0];
+        }
+        // 背景亮度倍率（原硬编码 0.7；散射项随背景同步缩放,0=纯黑背景突出盘本体）
+        v = new float[]{sp.backgroundBright};
+        if (sliderL("Background bright", v, 0.0f, 2.0f, "%.2f")) {
+            sp.backgroundBright = v[0];
+        }
+        // 色调映射强度：1=全 ACES 原行为,0=线性直出（高光硬钳,对比观察用）
+        v = new float[]{sp.toneMapStrength};
+        if (sliderL("Tonemap (ACES mix)", v, 0.0f, 1.0f, "%.2f")) {
+            sp.toneMapStrength = v[0];
+        }
+        // 多普勒 A/B 开关：仅切断轨道多普勒项（束流增亮/温移²）,RedShift 链仍含色移
+        if (ImGui.checkbox("Doppler beaming (I)", sp.dopplerIntensityEnabled)) {
+            sp.dopplerIntensityEnabled = !sp.dopplerIntensityEnabled;
+        }
+        if (ImGui.checkbox("Doppler temp shift (T)", sp.dopplerTemperatureEnabled)) {
+            sp.dopplerTemperatureEnabled = !sp.dopplerTemperatureEnabled;
         }
 
         ImGui.end();
@@ -367,6 +495,19 @@ public class Panels {
         if (sliderL("Background bright", v, 0.0f, 3.0f, "%.2f")) {
             kp.backgroundBrightmut = v[0];
         }
+        // 本项目扩展（iNoiseLut/iDiskScatter/iDiskAmbient 追加于 NPGS 布局末尾）：仅移植版
+        // shader 消费，NPGS 原版声明不含这些字段（自然忽略），故原版模式下隐藏这三条
+        if (scene.getSpacetime() == Scene.SpacetimeMode.KERR) {
+            // backlight=背光项（有方向性，只泛亮剪影）；all-sky=弥散项（无方向性，全天空均匀补底）
+            v = new float[]{kp.diskScatter};
+            if (sliderL("Disk scatter (backlight)", v, 0.0f, 1.0f, "%.2f")) {
+                kp.diskScatter = v[0];
+            }
+            v = new float[]{kp.diskAmbient};
+            if (sliderL("Disk ambient (all-sky)", v, 0.0f, 4.0f, "%.2f")) {
+                kp.diskAmbient = v[0];
+            }
+        }
         v = new float[]{kp.quality};
         if (sliderL("Quality (step)", v, 0.2f, 1.0f, "%.2f")) {
             kp.quality = v[0];
@@ -375,9 +516,11 @@ public class Panels {
         if (ImGui.checkbox("Prepass (half-res)", prepass)) {
             kp.prepassEnabled = !prepass;
         }
-        boolean noiseLut = kp.noiseLutEnabled;
-        if (ImGui.checkbox("Noise LUT (A/B)", noiseLut)) {
-            kp.noiseLutEnabled = !noiseLut;
+        if (scene.getSpacetime() == Scene.SpacetimeMode.KERR) {
+            boolean noiseLut = kp.noiseLutEnabled;
+            if (ImGui.checkbox("Noise LUT (A/B)", noiseLut)) {
+                kp.noiseLutEnabled = !noiseLut;
+            }
         }
 
         ImGui.separator();
@@ -416,6 +559,101 @@ public class Panels {
         if (sliderL("Haze strength", v, 0.0f, 2.0f, "%.2f")) {
             kp.heatHaze = v[0];
         }
+
+        ImGui.end();
+    }
+
+    /**
+     * NPGS 原版专有参数面板 —— 仅 KERR_NPGS（原版复刻）模式渲染。这些参数对应的 shader
+     * 代码在移植版中被裁剪（时空网格/致密星表面/白洞延拓/偏振/调试视图/贴图盘等），
+     * NpgsRender 每帧打包进 BlackHoleArgs UBO 对应字段，原版 shader 原生消费。
+     * 默认值 = NPGS Application.cpp 初始化值（全关）。
+     */
+    private void renderNpgsPanel(Scene scene) {
+        KerrParams kp = scene.getKerrParams();
+        float w = ImGui.getIO().getDisplaySizeX();
+        ImGui.setNextWindowPos(w - 250, 620, ImGuiCond.FirstUseEver);
+        ImGui.setNextWindowSize(400, 420);
+        ImGui.begin("NPGS Orig");
+
+        int[] iv;
+        float[] v;
+
+        ImGui.text("Spacetime structure");
+        // 时空网格：0=关 / 1=GridColor / 2=GridColorSimple（原版独有绘制）
+        iv = new int[]{kp.gridMode};
+        if (ImGui.sliderInt("##grid", iv, 0, 2)) {
+            kp.gridMode = iv[0];
+        }
+        ImGui.sameLine();
+        ImGui.text("Grid: " + (kp.gridMode == 0 ? "off" : kp.gridMode == 1 ? "GridColor" : "Simple"));
+        // 宇宙变体选层：6 套原装盒按 %3 选一套（0/1/2 三种星空）
+        iv = new int[]{kp.universeIndex};
+        if (ImGui.sliderInt("##universe", iv, 0, 2)) {
+            kp.universeIndex = iv[0];
+        }
+        ImGui.sameLine();
+        ImGui.text("Universe #" + kp.universeIndex);
+        if (ImGui.checkbox("Whitehole (max extension)", kp.whitehole)) {
+            kp.whitehole = !kp.whitehole;
+        }
+        if (ImGui.checkbox("Shadow culling", kp.shadowCulling)) {
+            kp.shadowCulling = !kp.shadowCulling;
+        }
+        // 相机所在空间侧（每条光线宇宙符号的种子，±1 二元）：测地穿越虫洞不自动翻转，需手动切
+        boolean antiUniverse = kp.universeSign < 0f;
+        if (ImGui.checkbox("Anti-universe side (sign -1)", antiUniverse)) {
+            kp.universeSign = antiUniverse ? 1.0f : -1.0f;
+        }
+
+        ImGui.separator();
+        ImGui.text("Dense star surface (orig only)");
+        v = new float[]{kp.densestarRadiusRs};
+        if (sliderL("Surface radius", v, 0.0f, 20.0f, kp.densestarRadiusRs == 0f ? "off" : "%.2f Rs")) {
+            kp.densestarRadiusRs = v[0];
+        }
+        v = new float[]{kp.densestarBlackbodyExp};
+        if (sliderL("T^exp (blackbody)", v, 0.25f, 8.0f, "%.2f")) {
+            kp.densestarBlackbodyExp = v[0];
+        }
+        v = new float[]{kp.densestarShiftColorExp};
+        if (sliderL("Shift->color exp", v, 0.0f, 3.0f, "%.2f")) {
+            kp.densestarShiftColorExp = v[0];
+        }
+        v = new float[]{kp.densestarShiftBrightExp};
+        if (sliderL("Shift->bright exp", v, 0.0f, 8.0f, "%.2f")) {
+            kp.densestarShiftBrightExp = v[0];
+        }
+        v = new float[]{kp.densestarBrightmut};
+        if (sliderL("Surface brightness", v, 0.0f, 5.0f, "%.2f")) {
+            kp.densestarBrightmut = v[0];
+        }
+
+        ImGui.separator();
+        ImGui.text("Image disk (orig only)");
+        if (ImGui.checkbox("Use image disk (R.jpg)", kp.useImageDisk)) {
+            kp.useImageDisk = !kp.useImageDisk;
+        }
+        v = new float[]{kp.imageRotationSpeed};
+        if (sliderL("Image rotation", v, 0.0f, 0.05f, "%.5f")) {
+            kp.imageRotationSpeed = v[0];
+        }
+
+        ImGui.separator();
+        ImGui.text("Polarization / Debug");
+        if (ImGui.checkbox("Polarization output", kp.polarization)) {
+            kp.polarization = !kp.polarization;
+        }
+        v = new float[]{kp.polarizationAngle};
+        if (sliderL("Polarizer angle", v, 0.0f, 3.14159f, "%.2f rad")) {
+            kp.polarizationAngle = v[0];
+        }
+        iv = new int[]{kp.debugMode};
+        if (ImGui.sliderInt("##debug", iv, 0, 4)) {
+            kp.debugMode = iv[0];
+        }
+        ImGui.sameLine();
+        ImGui.text("Debug view: " + kp.debugMode + (kp.debugMode == 3 ? " (step heat)" : ""));
 
         ImGui.end();
     }

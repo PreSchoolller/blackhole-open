@@ -97,11 +97,23 @@ public class DescSet {
      * @param type      描述符类型（如 VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER）
      */
     public void setImage(Device device, long sampler, long imageView, int binding, int type) {
+        setImage(device, sampler, imageView, binding, type, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+
+    /**
+     * 将图像绑定到指定绑定点（可指定图像布局）。
+     * <p>
+     * 存储图像（VK_DESCRIPTOR_TYPE_STORAGE_IMAGE，compute imageStore 写入）必须传
+     * VK_IMAGE_LAYOUT_GENERAL；采样读取用默认 SHADER_READ_ONLY_OPTIMAL。
+     *
+     * @param imageLayout 描述符声明的图像布局（须与 barrier 后实际布局一致）
+     */
+    public void setImage(Device device, long sampler, long imageView, int binding, int type, int imageLayout) {
         try (var stack = MemoryStack.stackPush()) {
             var imageInfo = VkDescriptorImageInfo.calloc(1, stack)
                     .sampler(sampler)
                     .imageView(imageView)
-                    .imageLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                    .imageLayout(imageLayout);
 
             var descrImage = VkWriteDescriptorSet.calloc(1, stack);
 
@@ -111,6 +123,35 @@ public class DescSet {
                     .dstBinding(binding)
                     .descriptorType(type)
                     .descriptorCount(1)
+                    .pImageInfo(imageInfo);
+
+            vkUpdateDescriptorSets(device.getVkDevice(), descrImage, null);
+        }
+    }
+
+    /**
+     * 将图像数组绑定到指定绑定点的 dstArrayElement 0..n-1（如 NPGS ColorBlend 的
+     * {@code iBloomTexs[2]}：[0]=黑洞原图，[1]=模糊图集）。所有元素按
+     * SHADER_READ_ONLY_OPTIMAL 布局写入。
+     */
+    public void setImageArray(Device device, long[] samplers, long[] imageViews, int binding, int type) {
+        try (var stack = MemoryStack.stackPush()) {
+            int n = samplers.length;
+            var imageInfo = VkDescriptorImageInfo.calloc(n, stack);
+            for (int i = 0; i < n; i++) {
+                imageInfo.get(i)
+                        .sampler(samplers[i])
+                        .imageView(imageViews[i])
+                        .imageLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            }
+
+            var descrImage = VkWriteDescriptorSet.calloc(1, stack);
+            descrImage.get(0)
+                    .sType$Default()
+                    .dstSet(vkDescriptorSet)
+                    .dstBinding(binding)
+                    .descriptorType(type)
+                    .descriptorCount(n)
                     .pImageInfo(imageInfo);
 
             vkUpdateDescriptorSets(device.getVkDevice(), descrImage, null);

@@ -94,6 +94,28 @@ public class EngCfg {
     private float timeRate;
     /** TAA 硬重置的帧间平移阈值（Rs/帧） */
     private float taaMotionResetThreshold;
+    /** 盘前向散射强度（背光项）：被盘消光的背景光散射回视线的比例，有方向性（0=关） */
+    private float diskScatter;
+    /** 盘环境光强度（弥散项）：全天空辐照×盘密度并入发射，无方向性（0=关） */
+    private float diskAmbient;
+    /** 曝光增益：autoExposure 后的全局亮度乘子（shader 原硬编码 2.0） */
+    private float exposure;
+    /** 盘频移钳制上限（shader 原硬编码 2.5） */
+    private float shiftMax;
+    /** TAA 静止累积时间常数 τ 基准秒（越大降噪越强/拖影越长；shader 原硬编码 0.3） */
+    private float taaTau;
+    /** Bloom 亮部阈值（bloomComposite 原硬编码 1.0） */
+    private float bloomThreshold;
+    /** Bloom 辉光混合系数（原硬编码 0.6） */
+    private float bloomMix;
+    /** Bloom 色调映射输出上限（原硬编码 12.0） */
+    private float bloomMax;
+    /** 背景亮度倍率（shader 原硬编码 0.7；散射项随 Bg 同步缩放） */
+    private float backgroundBright;
+    /** 色调映射强度：1=全 ACES（原行为），0=线性直出 */
+    private float tonemapStrength;
+    /** 盘半厚基准（Rs 倍数，shader 原硬编码 0.5·Rs；垂直密度/厚度/尘埃层随动） */
+    private float diskHalfThickness;
 
     // ---- 克尔时空参数（kerr.*；KerrParams 构造时取用，GUI 仍可运行时改） ----
     /** 无量纲自旋 a*（0=史瓦西极限，上限 0.998=极端克尔） */
@@ -102,6 +124,13 @@ public class EngCfg {
     private float kerrQuality;
     /** prepass 开关：半分辨率扭曲场 + composite 边缘感知合成 */
     private boolean kerrPrepassEnabled;
+    /** NPGS 原版 shader 复刻模式（npgs-verbatim 分支实验）：克尔时空由 NpgsRender 用
+     *  resources/shaders/npgs/ 下未改动的 NPGS 原始 GLSL 渲染（含其 6 套原装天空盒） */
+    private boolean npgsVerbatim;
+    /** NPGS 复刻模式直绘路径：跳过 prepass/composite，用 BlackHole.frag.glsl 全分辨率单 pass 直出 */
+    private boolean npgsDirect;
+    /** NPGS 复刻模式后处理链：PreBloom/GaussBlur/Blend 原版 compute 链（false=本框架 kerr_composite） */
+    private boolean npgsPostChain;
     /** 噪声哈希查表开关（PerlinNoise sin 哈希 ↔ LUT texelFetch 实时 A/B） */
     private boolean kerrNoiseLut;
     /** 山海星空盒开关（Antiverse0Skybox 纹理，两渲染器共用 DualSkybox 换绑，惰性加载） */
@@ -126,6 +155,10 @@ public class EngCfg {
     private float kerrShiftBrightnessExponent;
     /** iBackgroundBrightmut：背景星空亮度乘数 */
     private float kerrBackgroundBrightness;
+    /** iDiskScatter：盘前向散射强度——背光项，有方向性（0=关） */
+    private float kerrDiskScatter;
+    /** iDiskAmbient：盘环境光强度——弥散项，全天空辐照×盘密度（0=关） */
+    private float kerrDiskAmbient;
     /** iQ：无量纲电荷 Q*（Kerr–Newman 扩展） */
     private float kerrCharge;
     /** iMu：吸积物质比荷（参与盘温标） */
@@ -230,10 +263,25 @@ public class EngCfg {
         temperatureMin = Float.parseFloat(props.getOrDefault("blackhole.temperatureMin", 0.0f).toString());
         timeRate = Float.parseFloat(props.getOrDefault("blackhole.timeRate", 1.0f).toString());
         taaMotionResetThreshold = Float.parseFloat(props.getOrDefault("blackhole.taaMotionResetThreshold", 0.15f).toString());
+        diskScatter = Float.parseFloat(props.getOrDefault("blackhole.diskScatter", 0.25f).toString());
+        diskAmbient = Float.parseFloat(props.getOrDefault("blackhole.diskAmbient", 1.0f).toString());
+        exposure = Float.parseFloat(props.getOrDefault("blackhole.exposure", 2.0f).toString());
+        shiftMax = Float.parseFloat(props.getOrDefault("blackhole.shiftMax", 2.5f).toString());
+        taaTau = Float.parseFloat(props.getOrDefault("blackhole.taaTau", 0.3f).toString());
+        bloomThreshold = Float.parseFloat(props.getOrDefault("blackhole.bloomThreshold", 1.0f).toString());
+        bloomMix = Float.parseFloat(props.getOrDefault("blackhole.bloomMix", 0.6f).toString());
+        bloomMax = Float.parseFloat(props.getOrDefault("blackhole.bloomMax", 12.0f).toString());
+        backgroundBright = Float.parseFloat(props.getOrDefault("blackhole.backgroundBright", 0.7f).toString());
+        tonemapStrength = Float.parseFloat(props.getOrDefault("blackhole.tonemapStrength", 1.0f).toString());
+        diskHalfThickness = Float.parseFloat(props.getOrDefault("blackhole.diskHalfThickness", 0.5f).toString());
         // ---- 克尔时空参数（kerr.*） ----
         kerrSpin = Float.parseFloat(props.getOrDefault("kerr.spin", 0.9f).toString());
         kerrQuality = Float.parseFloat(props.getOrDefault("kerr.quality", 0.6f).toString());
         kerrPrepassEnabled = Boolean.parseBoolean(props.getOrDefault("kerr.prepassEnabled", false).toString());
+        // ---- NPGS 原版 shader 复刻（npgs.*，npgs-verbatim 分支实验） ----
+        npgsVerbatim = Boolean.parseBoolean(props.getOrDefault("npgs.verbatim", false).toString());
+        npgsDirect = Boolean.parseBoolean(props.getOrDefault("npgs.direct", false).toString());
+        npgsPostChain = Boolean.parseBoolean(props.getOrDefault("npgs.postChain", true).toString());
         kerrNoiseLut = Boolean.parseBoolean(props.getOrDefault("kerr.noiseLut", false).toString());
         mountainsSeasSkybox = Boolean.parseBoolean(props.getOrDefault("skybox.mountainsSeas", false).toString());
         kerrAccretionRate = Float.parseFloat(props.getOrDefault("kerr.accretionRate", 0.01f).toString());
@@ -246,6 +294,8 @@ public class EngCfg {
         kerrShiftColorExponent = Float.parseFloat(props.getOrDefault("kerr.shiftColorExponent", 1.0f).toString());
         kerrShiftBrightnessExponent = Float.parseFloat(props.getOrDefault("kerr.shiftBrightnessExponent", 4.0f).toString());
         kerrBackgroundBrightness = Float.parseFloat(props.getOrDefault("kerr.backgroundBrightness", 0.6f).toString());
+        kerrDiskScatter = Float.parseFloat(props.getOrDefault("kerr.diskScatter", 0.25f).toString());
+        kerrDiskAmbient = Float.parseFloat(props.getOrDefault("kerr.diskAmbient", 1.0f).toString());
         kerrCharge = Float.parseFloat(props.getOrDefault("kerr.charge", 0.0f).toString());
         kerrMu = Float.parseFloat(props.getOrDefault("kerr.mu", 1.0f).toString());
         kerrBackShiftMax = Float.parseFloat(props.getOrDefault("kerr.backShiftMax", 1.5f).toString());
@@ -379,6 +429,61 @@ public class EngCfg {
         return baseTemperature;
     }
 
+    /** 盘前向散射强度（背光项，被盘消光的背景光散射回视线的比例，0=关） */
+    public float getDiskScatter() {
+        return diskScatter;
+    }
+
+    /** 盘环境光强度（弥散项，全天空辐照×盘密度并入发射，0=关） */
+    public float getDiskAmbient() {
+        return diskAmbient;
+    }
+
+    /** 曝光增益（autoExposure 后的全局亮度乘子，原 shader 硬编码 2.0） */
+    public float getExposure() {
+        return exposure;
+    }
+
+    /** 盘频移钳制上限（原 shader 硬编码 2.5） */
+    public float getShiftMax() {
+        return shiftMax;
+    }
+
+    /** TAA 静止累积时间常数 τ 基准秒（原 shader 硬编码 0.3） */
+    public float getTaaTau() {
+        return taaTau;
+    }
+
+    /** Bloom 亮部阈值（原 bloomComposite 硬编码 1.0） */
+    public float getBloomThreshold() {
+        return bloomThreshold;
+    }
+
+    /** Bloom 辉光混合系数（原硬编码 0.6） */
+    public float getBloomMix() {
+        return bloomMix;
+    }
+
+    /** Bloom 色调映射输出上限（原硬编码 12.0） */
+    public float getBloomMax() {
+        return bloomMax;
+    }
+
+    /** 背景亮度倍率（shader 原硬编码 0.7；散射项随 Bg 同步缩放） */
+    public float getBackgroundBright() {
+        return backgroundBright;
+    }
+
+    /** 色调映射强度（1=全 ACES 原行为，0=线性直出） */
+    public float getTonemapStrength() {
+        return tonemapStrength;
+    }
+
+    /** 盘半厚基准（Rs 倍数，shader 原硬编码 0.5·Rs） */
+    public float getDiskHalfThickness() {
+        return diskHalfThickness;
+    }
+
     public float getTemperatureStep() {
         return temperatureStep;
     }
@@ -411,6 +516,21 @@ public class EngCfg {
 
     public boolean isKerrPrepassEnabled() {
         return kerrPrepassEnabled;
+    }
+
+    /** NPGS 原版 shader 复刻模式开关（npgs.verbatim；克尔时空用 NpgsRender + NPGS 原始 GLSL） */
+    public boolean isNpgsVerbatim() {
+        return npgsVerbatim;
+    }
+
+    /** NPGS 复刻模式直绘路径开关（npgs.direct；BlackHole.frag 全分辨率单 pass，无 prepass） */
+    public boolean isNpgsDirect() {
+        return npgsDirect;
+    }
+
+    /** NPGS 复刻模式原版后处理链开关（npgs.postChain；PreBloom/GaussBlur/Blend compute 链） */
+    public boolean isNpgsPostChain() {
+        return npgsPostChain;
     }
 
     public boolean isKerrNoiseLut() {
@@ -459,6 +579,16 @@ public class EngCfg {
 
     public float getKerrBackgroundBrightness() {
         return kerrBackgroundBrightness;
+    }
+
+    /** iDiskScatter：盘前向散射强度（背光项，有方向性，0=关） */
+    public float getKerrDiskScatter() {
+        return kerrDiskScatter;
+    }
+
+    /** iDiskAmbient：盘环境光强度（弥散项，全天空辐照×盘密度，0=关） */
+    public float getKerrDiskAmbient() {
+        return kerrDiskAmbient;
     }
 
     public float getKerrCharge() {

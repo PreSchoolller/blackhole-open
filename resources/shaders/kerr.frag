@@ -130,6 +130,8 @@ layout(set = 0, binding = 1) uniform BlackHoleArgs
     float iJetShiftMax;                  //喷流蓝移限制
     float iBlendWeight;                  //TAA前后帧混合权重。
     float iNoiseLut;                     //噪声哈希查表开关(本项目扩展字段,追加于 NPGS 布局末尾:0=程序化 sin 哈希,1=64³ LUT)
+    float iDiskScatter;                  //盘前向散射强度(本项目扩展字段,追加于 NPGS 布局末尾:被盘消光的背景光散射回视线的比例,0=关)
+    float iDiskAmbient;                  //盘环境光强度(本项目扩展字段,追加于 NPGS 布局末尾:全天空辐照×盘密度并入发射的弥散项,0=关)
 };
 
 layout(set = 1, binding = 0) uniform sampler2D iHistoryTex;
@@ -152,6 +154,13 @@ const float EPSILON = 1e-6;
 // 自旋/电荷 量纲化
 float PhysicalSpinA = iSpin * CONST_M;
 float PhysicalQ     = iQ * CONST_M;
+
+// 盘环境光弥散项（每像素 TraceRay 开头算一次的常量，供 DiskColor 逐样本消费）：
+// 全天空 6 向采样平均（ambient-cube 近似）× AMBIENT_PHASE 相位折扣。
+// 侧向入射光散射进视线的效率低于前向背光（相位函数前向峰化），故乘折扣，与
+// 背光项（main 合成处的 iDiskScatter）拼成完整的单次散射两块
+#define AMBIENT_PHASE 0.25
+vec3 gDiskAmbientSky = vec3(0.0);
 
 // =============================================================================
 // SECTION 2: 基础工具函数 (噪声、插值、随机)
@@ -1701,6 +1710,10 @@ vec4 DiskColor(vec4 BaseColor, vec4 RayPos, vec4 LastRayPos,
                          SampleColor.rgb = vec3(cMax + cMin) - SampleColor.rgb;
                          if(iWhitehole==0) SampleColor.rgba=vec4(0.0);
                      }
+                     // 环境光弥散项：全天空辐照（gDiskAmbientSky 已含相位折扣）× 本步不透明度
+                     // 随 StepSize 积分。冷暗盘区发射趋零而密度仍在 → 显形为均匀背景色补底，
+                     // 与背光项（main 合成处的 iDiskScatter）互补；E_emit<0 清零样本 alpha=0 无贡献
+                     SampleColor.rgb += iDiskAmbient * gDiskAmbientSky * SampleColor.a;
 
                      vec4 StepColor = SampleColor * StepSize;
 
@@ -2410,6 +2423,14 @@ TraceResult TraceRay(vec2 FragUv)
     res.FreqShift = 0.0;
     res.Status    = 0.0; // Default: Stop
     res.AccumColor = vec4(0.0);
+
+    // 盘环境光弥散项的全天空辐照：每像素一次 6 向 cubemap 采样，DiskColor 内零开销复用
+    if (iDiskAmbient > 0.0) {
+        gDiskAmbientSky = (AMBIENT_PHASE / 6.0) * (
+            textureLod(iBackground0, vec3( 1.0, 0.0, 0.0), 0.0).rgb + textureLod(iBackground0, vec3(-1.0, 0.0, 0.0), 0.0).rgb +
+            textureLod(iBackground0, vec3(0.0,  1.0, 0.0), 0.0).rgb + textureLod(iBackground0, vec3(0.0, -1.0, 0.0), 0.0).rgb +
+            textureLod(iBackground0, vec3(0.0, 0.0,  1.0), 0.0).rgb + textureLod(iBackground0, vec3(0.0, 0.0, -1.0), 0.0).rgb);
+    }
 
     bool bDeferredShadowCulling = false;
 
@@ -3176,6 +3197,10 @@ void main()
 
     if (Status > 0.5 && Status < 2.5) {
         vec4 Bg = SampleBackground(BgDir, Shift, Status);
+        // 前向散射：被盘消光的那部分背景光（≈Bg·FinalColor.a，此时 alpha 仍为盘体积累积值）
+        // 按 iDiskScatter 比例单次散射回视线（albedo ≤1 时能量守恒）。仅逃逸路径执行，
+        // 吸收（Status=0，阴影）不经过此处保持纯黑；亮背景下冷暗盘区自动泛背景微光
+        FinalColor.rgb += Bg.rgb * iDiskScatter * FinalColor.a;
         // 背景按体积光透过率逐通道叠加（蓝光被遮挡最快，红光最慢）
         FinalColor += 0.9999 * Bg * vec4(pow(1.0 - FinalColor.a, 1.0),
                                          pow(1.0 - FinalColor.a, 1.6),

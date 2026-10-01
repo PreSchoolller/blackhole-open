@@ -5,7 +5,6 @@ import org.joml.Quaternionf;
 import org.joml.Vector2f;
 import org.joml.Vector3f;
 import org.joml.Matrix4f;
-import vulkanb.eng.graph.BlackHoleRender;
 import vulkanb.eng.graph.gui.Panels;
 import vulkanb.eng.scene.Camera;
 import vulkanb.eng.scene.GeodesicIntegrator;
@@ -38,6 +37,9 @@ public class InputController {
     private boolean lookCaptured = false;
     /** 测地模式控制台读数的上次打印时间 */
     private long geodesicReadoutNanos;
+    /** 非测地模式（自由飞行/轨道）的穿越检测：上一帧相机位置（Rs） */
+    private final Vector3f freePrevPos = new Vector3f();
+    private boolean freePrevYValid;
 
     // ---- Phase 5:测地模式头部旋转与姿态推导暂存 ----
     /** 头部旋转（测地模式下鼠标/QE 滚转只转它;相机世界姿态由输运标架×headQuat 每帧推导） */
@@ -108,7 +110,43 @@ public class InputController {
         handleMouseLook(engCtx, camera, geodesicOn, cfgMouseSensitivity);
         handleRoll(engCtx, camera, geodesic, geodesicOn, diffTimeMillis, cfgRollSpeed);
         handleModeKeys(ki, camera, geodesic, geodesicOn, move, cfgZoomSpeed);
-        handleParamKeys(ki, geodesic, engCfg);
+        handleParamKeys(engCtx, ki, geodesic, engCfg);
+        if (!geodesicOn) {
+            handleFreeTraversal(engCtx, camera);
+        } else {
+            freePrevYValid = false; // 测地帧位置由积分器驱动（可能传送），作废穿越检测基准
+        }
+    }
+
+    /**
+     * 自由飞行/轨道模式的穿越检测：相机 y（自旋轴）帧间变号时插值赤道面穿越点，
+     * 柱面半径 ρ<|a|（环内穿喉道，与测地 GetIntermediateSign 同规则）即翻转
+     * iUniverseSign——shader 随即切到反宇宙侧渲染。符号经 KerrParams 与 GUI 复选框
+     * 天然同步；测地模式不用此路径（积分器子步级检测更精细）。
+     */
+    private void handleFreeTraversal(EngCtx engCtx, Camera camera) {
+        Scene scene = engCtx.scene();
+        var spacetime = scene.getSpacetime();
+        if (spacetime != Scene.SpacetimeMode.KERR && spacetime != Scene.SpacetimeMode.KERR_NPGS) {
+            freePrevYValid = false;
+            return;
+        }
+        Vector3f p = camera.getPosition();
+        if (freePrevYValid && freePrevPos.y * p.y < 0) {
+            double t = freePrevPos.y / (freePrevPos.y - p.y);
+            double crossX = freePrevPos.x + t * (p.x - freePrevPos.x);
+            double crossZ = freePrevPos.z + t * (p.z - freePrevPos.z);
+            double rho = Math.sqrt(crossX * crossX + crossZ * crossZ);
+            double ringA = Math.abs(scene.getKerrParams().spin) * 0.5;
+            var kp = scene.getKerrParams();
+            if (rho < ringA) {
+                kp.universeSign = -kp.universeSign;
+                AppLog.infof("自由飞行穿越喉道（ρ=%.3f < |a|=%.3f）→ 宇宙符号 %.0f",
+                        rho, ringA, kp.universeSign);
+            }
+        }
+        freePrevPos.set(p);
+        freePrevYValid = true;
     }
 
     /** 测地模式周期性控制台读数（update() 的 UPS 节拍调用） */
@@ -157,8 +195,9 @@ public class InputController {
             AppLog.infof("测地线模式：开启（v0=%.2fc，W/S=推力，[/]=推力大小，↑/↓=时间流速，R=圆轨道，G=退出）%n",
                     geodesic.getV0());
         } else {
-            camera.setPosition(geodesic.getPosition(new Vector3f()));
+            // 先 deactivate（可能从奇异区弹出复位位置），再把（复位后的）位置交给自由视角相机
             geodesic.deactivate();
+            camera.setPosition(geodesic.getPosition(new Vector3f()));
             camera.setModeRaw(Camera.CameraMode.FREE_FLY);
             AppLog.infof("测地线模式：关闭（当前位置 r = %.1f Rs）%n", geodesic.getRadius());
         }
@@ -180,6 +219,8 @@ public class InputController {
         // 每帧同步 GUI 自旋：积分器度规随 a* 变化（两种时空模式共用同一积分器）
         geodesic.setSpin(engCtx.scene().getKerrParams().spin);
         geodesic.setHeadRotation(headQuat);
+        // 视界护栏随坠落演出开关联动（演出关 = 允许积分穿过视界/虫洞喉道）
+        geodesic.setHorizonGuard(engCtx.scene().isHorizonFallEnabled());
         // 时间暂停（P 键）：跳过积分推进与推力——相机位置定格，鼠标转头(deriveCameraOrientation)
         // 仍生效，便于在冻结的画面里环顾
         if (!engCtx.scene().isTimePaused()) {
@@ -188,7 +229,7 @@ public class InputController {
                 geodesic.updateFall(diffTimeMillis);
             } else {
                 geodesic.step(diffTimeMillis);
-                if (geodesic.getRadius() < 1.02) {
+                if (engCtx.scene().isHorizonFallEnabled() && geodesic.getRadius() < 1.02) {
                     geodesic.beginHorizonFall();
                     AppLog.info("已越过事件视界，正在拉回安全轨道…");
                 }
@@ -326,7 +367,7 @@ public class InputController {
     }
 
     /** 全局参数键：1/2 测地初速 v0 ±0.05c（进入测地模式前设置）、NumPad± 基准温度 */
-    private void handleParamKeys(KeyboardInput ki, GeodesicIntegrator geodesic, EngCfg engCfg) {
+    private void handleParamKeys(EngCtx engCtx, KeyboardInput ki, GeodesicIntegrator geodesic, EngCfg engCfg) {
         if (ki.keySinglePress(GLFW_KEY_1)) {
             geodesic.adjustV0(-0.05);
             AppLog.infof("测地线初速度：%.2f c%n", geodesic.getV0());
@@ -336,15 +377,18 @@ public class InputController {
             AppLog.infof("测地线初速度：%.2f c%n", geodesic.getV0());
         }
 
+        // NumPad ±：基准温度（与 Black Hole 面板滑条并行写同一字段）
         if (ki.keySinglePress(GLFW_KEY_KP_ADD)) {
-            BlackHoleRender.BaseTemperature = Math.min(engCfg.getTemperatureMax(),
-                    BlackHoleRender.BaseTemperature + engCfg.getTemperatureStep());
-            AppLog.info("当前温度为： " + BlackHoleRender.BaseTemperature);
+            var sp = engCtx.scene().getSchwarzschildParams();
+            sp.baseTemperature = Math.min(engCfg.getTemperatureMax(),
+                    sp.baseTemperature + engCfg.getTemperatureStep());
+            AppLog.info("当前温度为： " + sp.baseTemperature);
         }
         if (ki.keySinglePress(GLFW_KEY_KP_SUBTRACT)) {
-            BlackHoleRender.BaseTemperature = Math.max(engCfg.getTemperatureMin(),
-                    BlackHoleRender.BaseTemperature - engCfg.getTemperatureStep());
-            AppLog.info("当前温度为： " + BlackHoleRender.BaseTemperature);
+            var sp = engCtx.scene().getSchwarzschildParams();
+            sp.baseTemperature = Math.max(engCfg.getTemperatureMin(),
+                    sp.baseTemperature - engCfg.getTemperatureStep());
+            AppLog.info("当前温度为： " + sp.baseTemperature);
         }
     }
 

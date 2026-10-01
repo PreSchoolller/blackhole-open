@@ -55,10 +55,12 @@ public class Render {
     private final Semaphore[] renderCompleteSemphs;
     /** Vulkan 核心上下文 */
     private final VkCtx vkCtx;
-    /** 黑洞渲染器（史瓦西模式 lazy 持有；切克尔时置空） */
+    /** 黑洞渲染器（史瓦西模式 lazy 持有；切克尔系模式时置空） */
     private BlackHoleRender blackHoleRender;
-    /** 克尔渲染器（lazy：仅当 spacetime=KERR 时创建/销毁） */
+    /** 克尔渲染器（移植版；KERR 模式持有） */
     private KerrRender kerrRender;
+    /** NPGS 原版 shader 复刻渲染器（KERR_NPGS 模式持有；GUI 单选热切换，与 Kerr 系共用 KerrParams） */
+    private NpgsRender npgsRender;
     /** 当前激活的时空模式（与 Scene 状态每帧比对，变化时热切换渲染器） */
     private Scene.SpacetimeMode activeSpacetime;
     /** GUI 渲染器（ImGui 叠加层，最后绘制） */
@@ -100,9 +102,9 @@ public class Render {
         }
         resize = false;
 
-        // 按当前时空模式创建渲染器（默认史瓦西；克尔 lazy）
+        // 按当前时空模式创建渲染器（默认史瓦西；克尔系 lazy）
         activeSpacetime = engCtx.scene().getSpacetime();
-        blackHoleRender = activeSpacetime == Scene.SpacetimeMode.KERR ? null : new BlackHoleRender(vkCtx);
+        blackHoleRender = isKerrFamily(activeSpacetime) ? null : new BlackHoleRender(vkCtx);
 
         // 创建 GUI 渲染器（ImGui 上下文在 init() 中创建，早于首帧 input()）
         guiRender = new GuiRender();
@@ -118,6 +120,9 @@ public class Render {
         }
         if (kerrRender != null) {
             kerrRender.cleanup(vkCtx);
+        }
+        if (npgsRender != null) {
+            npgsRender.cleanup(vkCtx);
         }
         guiRender.cleanup(vkCtx);
 
@@ -140,14 +145,18 @@ public class Render {
         blackHoleRender.init(vkCtx, vertSpv, fragSpv, bloomSpv);
     }
 
+    /** 克尔系模式（移植版与 NPGS 原版复刻共用 KerrParams/测地相机/GUI 数据源） */
+    private static boolean isKerrFamily(Scene.SpacetimeMode mode) {
+        return mode == Scene.SpacetimeMode.KERR || mode == Scene.SpacetimeMode.KERR_NPGS;
+    }
+
     /**
      * 初始化渲染管线（按当前时空模式分派）。
      */
     public void init(EngCtx engCtx, int width, int height) {
         activeSpacetime = engCtx.scene().getSpacetime();
-        if (activeSpacetime == Scene.SpacetimeMode.KERR) {
-            kerrRender = new KerrRender();
-            kerrRender.init(vkCtx, engCtx);
+        if (isKerrFamily(activeSpacetime)) {
+            initKerr(engCtx);
         } else {
             initSchwarzschild(vkCtx);
         }
@@ -161,20 +170,40 @@ public class Render {
     /** 热切换时空模式：等待 GPU 空闲 → 释放旧渲染器 → 创建新渲染器 */
     private void switchSpacetime(EngCtx engCtx, Scene.SpacetimeMode wanted) {
         vkCtx.getDevice().waitIdle();
-        if (activeSpacetime == Scene.SpacetimeMode.KERR) {
-            kerrRender.cleanup(vkCtx);
-            kerrRender = null;
+        if (activeSpacetime == Scene.SpacetimeMode.KERR || activeSpacetime == Scene.SpacetimeMode.KERR_NPGS) {
+            cleanupKerr();
         } else {
             blackHoleRender.cleanup(vkCtx);
             blackHoleRender = null;
         }
         activeSpacetime = wanted;
-        if (wanted == Scene.SpacetimeMode.KERR) {
-            kerrRender = new KerrRender();
-            kerrRender.init(vkCtx, engCtx);
+        if (wanted == Scene.SpacetimeMode.KERR || wanted == Scene.SpacetimeMode.KERR_NPGS) {
+            initKerr(engCtx);
         } else {
             blackHoleRender = new BlackHoleRender(vkCtx);
             initSchwarzschild(vkCtx);
+        }
+    }
+
+    /** 克尔系渲染器创建：KERR=移植版 KerrRender，KERR_NPGS=NPGS 原版 shader 复刻渲染器 */
+    private void initKerr(EngCtx engCtx) {
+        if (activeSpacetime == Scene.SpacetimeMode.KERR_NPGS) {
+            npgsRender = new NpgsRender();
+            npgsRender.init(vkCtx, engCtx);
+        } else {
+            kerrRender = new KerrRender();
+            kerrRender.init(vkCtx, engCtx);
+        }
+    }
+
+    /** 克尔系渲染器释放（与 initKerr 的模式分派对应） */
+    private void cleanupKerr() {
+        if (npgsRender != null) {
+            npgsRender.cleanup(vkCtx);
+            npgsRender = null;
+        } else if (kerrRender != null) {
+            kerrRender.cleanup(vkCtx);
+            kerrRender = null;
         }
     }
 
@@ -241,7 +270,9 @@ public class Render {
         }
 
         // 执行全屏渲染（使用动态渲染，无需 RenderPass/Framebuffer）
-        if (activeSpacetime == Scene.SpacetimeMode.KERR) {
+        if (activeSpacetime == Scene.SpacetimeMode.KERR_NPGS) {
+            npgsRender.render(vkCtx, cmdBuffer, engCtx, currentRenderFrame, imageIndex);
+        } else if (activeSpacetime == Scene.SpacetimeMode.KERR) {
             kerrRender.render(vkCtx, cmdBuffer, engCtx, currentRenderFrame, imageIndex);
         } else {
             blackHoleRender.render(vkCtx, cmdBuffer, engCtx, currentRenderFrame, imageIndex);
@@ -332,11 +363,13 @@ public class Render {
         // 更新投影矩阵和渲染器的视口
         VkExtent2D extent = vkCtx.getSwapChain().getSwapChainExtent();
         engCtx.scene().getProjection().resize(extent.width(), extent.height());
-        if (activeSpacetime == Scene.SpacetimeMode.KERR) {
+        if (activeSpacetime == Scene.SpacetimeMode.KERR_NPGS) {
+            npgsRender.resize(vkCtx, extent.width(), extent.height());
+        } else if (activeSpacetime == Scene.SpacetimeMode.KERR) {
             kerrRender.resize(vkCtx, extent.width(), extent.height());
         } else {
             blackHoleRender.resize(vkCtx, extent.width(), extent.height());
         }
-        guiRender.resize(vkCtx, engCtx);
+        guiRender.resize(vkCtx);
     }
 }

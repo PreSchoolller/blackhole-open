@@ -12,10 +12,10 @@
  *   4. 归一化得到世界空间射线方向
  */
 
-// Push Constants：从 CPU 传递的快速常量数据（204 字节）
-// 单位约定：cameraPos/blackHolePos/schwarzschildRadius 为世界坐标长度；
-//           diskInner/OuterRadius 为 Rs 的倍数（frag 内乘 Rs 换算）
-layout(push_constant) uniform PushConstants {
+// BlackHoleArgs 参数 UBO（set 2, binding 0，VERTEX|FRAGMENT 两阶段可见）：
+// 顶点只消费 inverseView/inverseProj/cameraPos;块布局必须与 blackhole.frag 的
+// 声明逐字段一致（std140,232B 数据对齐 16 → 240B）,vert 未访问尾部字段属正常
+layout(set = 2, binding = 0) uniform BlackHoleArgs {
     mat4 inverseView;           // 视图矩阵的逆矩阵（世界 → 视图的逆操作）
     mat4 inverseProj;           // 投影矩阵的逆矩阵（裁剪 → 视图的逆操作）
     vec3 cameraPos;             // 相机世界坐标位置
@@ -24,7 +24,7 @@ layout(push_constant) uniform PushConstants {
     float schwarzschildRadius;  // 史瓦西半径 Rs（世界坐标长度单位）
     float diskInnerRadius;      // 吸积盘内半径（Rs 的倍数）
     float diskOuterRadius;      // 吸积盘外半径（Rs 的倍数）
-    float rotationSpeed;        // 吸积盘旋转速度
+    float iExposure;            // 曝光增益（vert 未使用）
     float temperature;          // 基础温度 (K)，默认 5000
     int   if_dopplerI;          // 多普勒亮度调制开关
     int   if_dopplerT;          // 多普勒温度偏移开关
@@ -32,10 +32,20 @@ layout(push_constant) uniform PushConstants {
     float iTimeDelta;               // 帧间隔（秒），TAA blendWeight 用
     int   iFrame;                   // 全局帧计数，TAA 前 2 帧强制重置
     int   iCameraMoved;             // TAA 三态：0=静止全量累积 2=平滑运动部分混合 1=硬重置
-    float place_holder4;            // 对齐 pad
+    float iRenderTime;              // 渲染时间（墙钟，TAA 抖动种子；vert 未使用）
     float iFade;                    // 视界坠落淡出系数 0..1（1=全黑），兼作对齐
     vec3  iCameraVel;               // 相机速度 β（单位 c，静态观者系；非测地模式为 0）
     float iCameraGamma;             // 相机洛伦兹因子 γ
+    float iDiskScatter;             // 盘前向散射强度（0=关；vert 未使用）
+    float iDiskAmbient;             // 盘环境光强度（0=关；vert 未使用）
+    float iShiftMax;                // 盘频移钳制上限（vert 未使用）
+    float iTaaTau;                  // TAA 静止累积 τ 基准秒（vert 未使用）
+    float iBloomThreshold;          // Bloom 亮部阈值（vert 未使用）
+    float iBloomMix;                // Bloom 辉光混合系数（vert 未使用）
+    float iBloomMax;                // Bloom 色调映射输出上限（vert 未使用）
+    float iBackgroundBright;        // 背景亮度倍率（vert 未使用）
+    float iToneMapStrength;         // 色调映射强度（vert 未使用）
+    float iDiskHalfThickness;       // 盘半厚基准（vert 未使用）
 } pc;
 
 // 输出到片段着色器的数据

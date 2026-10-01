@@ -1,12 +1,14 @@
 #version 450
 
 // ============================================================
-// 1. Push Constants — 单位约定
+// 1. BlackHoleArgs 参数 UBO（set 2, binding 0）— 单位约定
 //    cameraPos / blackHolePos / schwarzschildRadius: 世界坐标长度
 //    diskInner/OuterRadius: Rs 的倍数（shader 内乘 Rs 换算为世界单位）
 //    temperature: 开尔文
+//    布局 std140:三个 vec3 后各跟一个 float 占尾、int/float 链 4B 对齐——
+//    与原 push constant 字段序逐字节一致,240B（232 对齐 16）
 // ============================================================
-layout(push_constant) uniform PushConstants {
+layout(set = 2, binding = 0) uniform BlackHoleArgs {
     mat4 inverseView;               // 视图逆矩阵（frag 未使用，顶点反投影用）
     mat4 inverseProj;               // 投影逆矩阵（frag 未使用，顶点反投影用）
     vec3 cameraPos;                 // 相机世界坐标（用于引力红移）
@@ -15,10 +17,11 @@ layout(push_constant) uniform PushConstants {
     float schwarzschildRadius;      // 史瓦西半径 Rs（世界坐标长度单位）
     float diskInnerRadius;          // 盘内半径（Rs 的倍数，shader 内乘 Rs 换算）
     float diskOuterRadius;          // 盘外半径（Rs 的倍数，shader 内乘 Rs 换算）
-    float rotationSpeed;            // 未使用
+    float iExposure;                // 曝光增益：autoExposure 后的全局亮度乘子（原硬编码 2.0,
+                                    //  槽位复用原 rotationSpeed 死字段,Phase 3）
     float temperature;              // 基准温度（内盘温度，开尔文）
-    int   if_dopplerI;              // 多普勒亮度开关
-    int   if_dopplerT;              // 多普勒温度开关（保留）
+    int   if_dopplerI;              // 多普勒亮度开关：切断轨道多普勒增亮项（A/B 实验）
+    int   if_dopplerT;              // 多普勒温度开关：切断轨道多普勒²温移项（A/B 实验）
     float timeRate;                 // 时间速率（用于动画速度）
     float iTimeDelta;               // 帧间隔（秒），TAA blendWeight 用
     int   iFrame;                   // 全局帧计数，TAA 前 2 帧强制重置
@@ -27,6 +30,16 @@ layout(push_constant) uniform PushConstants {
     float iFade;                    // 视界坠落淡出系数 0..1（1=全黑），兼作对齐
     vec3  iCameraVel;               // 相机速度 β（单位 c，静态观者系；非测地模式为 0）
     float iCameraGamma;             // 相机洛伦兹因子 γ
+    float iDiskScatter;             // 盘前向散射强度：被盘消光的背景光散射回视线的比例（0=关）
+    float iDiskAmbient;             // 盘环境光强度：全天空辐照×盘密度并入发射的弥散项（0=关）
+    float iShiftMax;                // 盘频移钳制上限（原硬编码 2.5）
+    float iTaaTau;                  // TAA 静止累积时间常数 τ 基准秒（原硬编码 0.3）
+    float iBloomThreshold;          // Bloom 亮部阈值（bloomComposite,原硬编码 1.0）
+    float iBloomMix;                // Bloom 辉光混合系数（原硬编码 0.6）
+    float iBloomMax;                // Bloom 色调映射输出上限（原硬编码 12.0）
+    float iBackgroundBright;        // 背景亮度倍率（原硬编码 0.7;散射项随 Bg 同步缩放）
+    float iToneMapStrength;         // 色调映射强度：1=全 ACES（原行为）,0=线性直出
+    float iDiskHalfThickness;       // 盘半厚基准（Rs 倍数,默认 0.5=原 0.5·Rs 硬编码;垂直密度/厚度/尘埃层随动）
 } pc;
 
 // 相机速度多普勒因子 g = γ·(1-β·n̂)，n̂ = 光子传播方向（从光源指向观测者的单位向量）
@@ -47,7 +60,13 @@ layout(set = 1, binding = 0) uniform sampler2D uPrevFrame;
 
 #define PI 3.141592653589
 #define MAX_STEPS 4096
-#define GLOBAL_EXPOSURE 2.0
+// （原 GLOBAL_EXPOSURE 2.0 死定义已删：曝光增益现走 UBO 字段 iExposure,GUI 可调）
+
+// 盘环境光弥散项的相位折扣：侧向入射光散射进视线的效率低于前向背光（相位函数前向
+// 峰化），故乘此折扣，与背光项（背景合成处的 iDiskScatter）拼成完整的单次散射两块
+#define AMBIENT_PHASE 0.25
+// 每像素 main 开头算一次的全天空辐照（ambient-cube 6 向平均 × 相位折扣），DiskColor 内零开销复用
+vec3 gDiskAmbientSky = vec3(0.0);
 
 float softHold(float x) { return 1.0 - 1.0 / (max(x, 0.0) + 1.0); }
 
@@ -170,9 +189,9 @@ vec4 DiskLayerColor(float ThetaWithoutTime, float AngularVelocity,
     float DustBound = 1.0 - 5.0 * pow(2.0 * (1.0 - EffectiveRadius), 2.0);
 
     float Density = Shape(EffectiveRadius, 4.0, 0.9);
-    if (abs(PosY) < 0.5 * Rs * Density)
+    if (abs(PosY) < pc.iDiskHalfThickness * Rs * Density)
     {
-        float Thick = 0.5 * Rs * Density * (0.4 + 0.6 * softHold(GenerateDiskNoise(vec3(1.5 * PosTheta, PosR / Rs, 1.0), 1, 3, 80.0)));
+        float Thick = pc.iDiskHalfThickness * Rs * Density * (0.4 + 0.6 * softHold(GenerateDiskNoise(vec3(1.5 * PosTheta, PosR / Rs, 1.0), 1, 3, 80.0)));
         float VerticalMixFactor = max(0.0, (1.0 - abs(PosY) / Thick));
         Density *= 0.7 * VerticalMixFactor * Density;
         C = vec4(GenerateDiskNoise(vec3(1.0 * PosR / Rs, 1.0 * PosY / Rs, 0.5 * PosTheta), 3, 6, 80.0));
@@ -180,9 +199,9 @@ vec4 DiskLayerColor(float ThetaWithoutTime, float AngularVelocity,
                     GenerateDiskNoise(vec3(PosR / Rs, 1.5 * PosTheta, PosY / Rs), 1, 3, 80.0));
         C.a *= Density;
     }
-    if (abs(PosY) < 0.5 * Rs * DustBound)
+    if (abs(PosY) < pc.iDiskHalfThickness * Rs * DustBound)
     {
-        float DustColor = max(1.0 - pow(PosY / (0.5 * Rs * max(DustBound, 0.0001)), 2.0), 0.0) *
+        float DustColor = max(1.0 - pow(PosY / (pc.iDiskHalfThickness * Rs * max(DustBound, 0.0001)), 2.0), 0.0) *
                 GenerateDiskNoise(vec3(1.5 * fract((1.5 * ThetaWithoutTime + PI / HalfPiTimeInside * EffectiveTime + Phase) / (2.0 * PI)) * 2.0 * PI, PosR / Rs, PosY / Rs), 0, 6, 80.0);
         C += 0.02 * vec4(vec3(DustColor), 0.2 * DustColor) * sqrt(1.0001 - DirOnDisk.y * DirOnDisk.y) * min(1.0, Doppler * Doppler);
     }
@@ -206,7 +225,7 @@ vec4 DiskColor(vec4 BaseColor, float StepLength,
     vec3 DirOnDisk = RayDir;
 
     vec4 Color = vec4(0.0);
-    if (abs(PosY) < 0.5 * Rs && PosR < ROut && PosR > RIn)
+    if (abs(PosY) < pc.iDiskHalfThickness * Rs && PosR < ROut && PosR > RIn)
     {
         float EffectiveRadius = 1.0 - ((PosR - RIn) / (ROut - RIn) * 0.5);
         if ((ROut - RIn) > 9.0 * Rs)
@@ -217,8 +236,8 @@ vec4 DiskColor(vec4 BaseColor, float StepLength,
                 EffectiveRadius = 1.0 - (0.5/0.9*0.5 + ((PosR-RIn)/(ROut-RIn) - 5.0*Rs/(ROut-RIn)) / (1.0 - 5.0*Rs/(ROut-RIn)) * 0.5);
         }
 
-        if ((abs(PosY) < 0.5 * Rs * Shape(EffectiveRadius, 4.0, 0.9)) ||
-            (PosY < 0.5 * Rs * (1.0 - 5.0 * pow(2.0 * (1.0 - EffectiveRadius), 2.0))))
+        if ((abs(PosY) < pc.iDiskHalfThickness * Rs * Shape(EffectiveRadius, 4.0, 0.9)) ||
+            (PosY < pc.iDiskHalfThickness * Rs * (1.0 - 5.0 * pow(2.0 * (1.0 - EffectiveRadius), 2.0))))
         {
             float AngularVelocity  = omega(PosR, Rs);
             float HalfPiTimeInside = PI / omega(3.0 * Rs, Rs);
@@ -259,18 +278,26 @@ vec4 DiskColor(vec4 BaseColor, float StepLength,
             float QuadraticedPeakTemperature = pow(pc.temperature, 4);  // 峰值温度四次方
 
             float BrightWithoutRedShift = 4.5 * pow(DiskTemperature, 4) / QuadraticedPeakTemperature;
+            // if_dopplerT：轨道多普勒²温移项 A/B 开关（关=温移只剩 RedShift 链,渐近侧不再偏冷）
             if (DiskTemperature > 1000.0)
-                DiskTemperature = max(1000.0, DiskTemperature * RedShift * Doppler * Doppler);
+                DiskTemperature = max(1000.0, DiskTemperature * RedShift *
+                                       mix(1.0, Doppler * Doppler, float(pc.if_dopplerT)));
 
             DiskTemperature = min(100000.0, DiskTemperature);
 
             Color.xyz *= BrightWithoutRedShift * min(1.0, 1.8 * (ROut - PosR) / (ROut - RIn)) *
                          RGB(DiskTemperature / exp((PosR - RIn) / (0.6 * (ROut - RIn))));
-            Color.xyz *= min(ShiftMax, RedShift) * min(ShiftMax, Doppler)
+            // if_dopplerI：轨道多普勒相对论束流增亮 A/B 开关（关=趋近侧不再偏亮;
+            //  RedShift 链仍含多普勒色移,故不对称不会完全消失）
+            Color.xyz *= min(ShiftMax, RedShift) * mix(1.0, min(ShiftMax, Doppler), float(pc.if_dopplerI))
                        * clamp(CamG * CamG * CamG, 0.1, 10.0);
             RedShift = min(RedShift, ShiftMax);
             Color.xyz *= pow((1.0 - (1.0 - min(1.0, RedShift)) * (PosR - RIn) / (ROut - RIn)), 9.0);
             Color.xyz *= min(1.0, 1.0 + 0.5 * ((PosR - RIn) / RIn + RIn / (PosR - RIn)) - max(1.0, RedShift));
+            // 环境光弥散项：全天空辐照（gDiskAmbientSky 已含相位折扣）× 本步不透明度随
+            // StepLength 积分。冷暗盘区发射趋零而密度仍在 → 显形为均匀背景色补底，与背光项
+            // （背景合成处的 iDiskScatter）互补；表现项，不做频移
+            Color.xyz += pc.iDiskAmbient * gDiskAmbientSky * Color.a;
 
             Color *= StepLength / Rs; // 步长以 Rs 归一（与文章 steplength/Rs 一致）
         }
@@ -337,7 +364,9 @@ vec4 BackgroundColor(vec3 Dir, float BlueShift) {
     float Shift = min(BlueShift * CamG, 8.0);
 
     vec3 result = BlackbodyDoppler(skyColor, Shift);
-    return 0.7 * vec4(result, 1.0);
+    // 背景亮度倍率（GUI 可调,原硬编码 0.7）;前向散射项经 Bg 同步缩放——
+    // 背景调暗则剪影泛光同步变暗,黑洞阴影不受影响
+    return pc.iBackgroundBright * vec4(result, 1.0);
 }
 
 // ---- TAA 时域累积（色调映射前,HDR 域混合） ----
@@ -347,7 +376,8 @@ vec4 BackgroundColor(vec3 Dir, float BlueShift) {
 vec4 ApplyTAA(vec4 Current) {
     if (pc.iFrame >= 2 && pc.iCameraMoved == 0) {
         // 历史时间常数 τ：越大降噪越强、拖影越长；动画加速时按 timeRate 缩短
-        float Tau = clamp(0.3 / max(pc.timeRate, 0.1), 0.02, 0.3);
+        // （基准 τ 来自 UBO iTaaTau,GUI 可调;原硬编码 0.3）
+        float Tau = clamp(pc.iTaaTau / max(pc.timeRate, 0.1), 0.02, pc.iTaaTau);
         float BlendWeight = 1.0 - pow(0.5, clamp(pc.iTimeDelta, 0.0001, 0.1) / Tau);
         vec4 PrevColor = texelFetch(uPrevFrame, ivec2(gl_FragCoord.xy), 0);
         // 防御：历史中的异常值（如未初始化内存的大数）不进入累积
@@ -387,7 +417,7 @@ void main() {
     int count = 0;
     bool bShouldContinueMarchRay = true;
     bool bWaitCalBack = false;
-    float ShiftMax = 2.5;   // 红/蓝移上限:留出相机多普勒动态范围(原 1.5 会把趋近侧钳死)
+    float ShiftMax = pc.iShiftMax;   // 红/蓝移上限:留出相机多普勒动态范围(原 1.5 会把趋近侧钳死)
     float CamR = length(pc.cameraPos - BHPos);
     // 背景引力蓝移：√(1-Rs/CamR) 的倒数（相机越近蓝移越强）
     float BackgroundBlueShift = min(1.0 / sqrt(1.0 - Rs / max(CamR, 1.001 * Rs) + 0.005), 2.0);
@@ -403,6 +433,14 @@ void main() {
     vec3 LastRayPos = RayPos;
     vec3 LastRayDir = RayDir;
     float StepLength = 0.0;
+
+    // 盘环境光弥散项的全天空辐照：每像素一次 6 向 cubemap 采样，DiskColor 内零开销复用
+    if (pc.iDiskAmbient > 0.0) {
+        gDiskAmbientSky = (AMBIENT_PHASE / 6.0) * (
+            textureLod(uSkybox, vec3( 1.0, 0.0, 0.0), 0.0).rgb + textureLod(uSkybox, vec3(-1.0, 0.0, 0.0), 0.0).rgb +
+            textureLod(uSkybox, vec3(0.0,  1.0, 0.0), 0.0).rgb + textureLod(uSkybox, vec3(0.0, -1.0, 0.0), 0.0).rgb +
+            textureLod(uSkybox, vec3(0.0, 0.0,  1.0), 0.0).rgb + textureLod(uSkybox, vec3(0.0, 0.0, -1.0), 0.0).rgb);
+    }
 
     while (bShouldContinueMarchRay && count < MAX_STEPS) {
         PosToBH = RayPos - BHPos;
@@ -460,16 +498,21 @@ void main() {
 
     // ---- 背景采样（若逃逸） ----
     if (bWaitCalBack) {
-        Result += BackgroundColor(normalize(RayDir), BackgroundBlueShift) * (1.0 - Result.a);
+        vec4 Bg = BackgroundColor(normalize(RayDir), BackgroundBlueShift);
+        // 前向散射：被盘消光的那部分背景光（≈Bg·Result.a）按 iDiskScatter 比例单次散射回视线
+        // （albedo ≤1 时能量守恒：透射 (1-a) + 散射 σ·a ≤ 入射）。仅在逃逸路径执行，视界捕获
+        // （bWaitCalBack=false）不经过此处，阴影保持纯黑；亮背景下冷暗盘区自动泛背景微光
+        Result.rgb += Bg.rgb * pc.iDiskScatter * Result.a;
+        Result += Bg * (1.0 - Result.a);
     }
 
     // 1. 物理 HDR 值此时可能高达 50+
     // 2. 自动曝光补偿（防瞎眼）
     float autoExposure = 1.0 / (1.0 + Result.r + Result.g + Result.b); // 或者用 shift 反比
-    Result.rgb *= autoExposure * 2.0; // 控制整体亮度
+    Result.rgb *= autoExposure * pc.iExposure; // 控制整体亮度（GUI 可调,原硬编码 2.0）
 
-    // 3. 色调映射（把 HDR 压缩进 LDR）
-    Result.rgb = ACESFilm(Result.rgb);
+    // 3. 色调映射（把 HDR 压缩进 LDR；强度可调——1=全 ACES 原行为,0=线性直出观察高光硬钳）
+    Result.rgb = mix(Result.rgb, ACESFilm(Result.rgb), pc.iToneMapStrength);
 
     // ---- TAA 时域累积 → 输出 HDR（预色调映射;Bloom 合成 pass 负责色调映射 + bloom + 淡出） ----
     outColor = ApplyTAA(Result);
