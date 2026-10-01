@@ -11,9 +11,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: windows-latest, label: windows-x64 }
-          - { os: ubuntu-latest,  label: linux-x64 }
-          - { os: macos-15,       label: macos-arm64 }   # Intel runner（macos-13）已退役；Intel Mac 用户请改用仓库 jar + 自装 JDK
+          - { os: windows-latest, label: windows-x64, platform: windows }
+          - { os: ubuntu-latest,  label: linux-x64,  platform: linux }
+          - { os: macos-15,       label: macos-arm64, platform: macos }   # Intel runner（macos-13）已退役；Intel Mac 用户请改用 universal jar + 自装 JDK
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -29,8 +29,9 @@ jobs:
           java-version: '17'
           cache: maven
 
-      - name: Build fat jar
-        run: mvn -B -ntp package
+      # 只带本平台 natives 的瘦身 jar，供 jpackage 打平台包
+      - name: Build platform jar
+        run: mvn -B -ntp package -Dplatform=${{ matrix.platform }}
 
       - name: Prepare jpackage input
         shell: bash
@@ -82,10 +83,13 @@ jobs:
           name: BlackHole-${{ matrix.label }}
           path: target/BlackHole-${{ env.ASSET_VER }}-${{ matrix.label }}.zip
 
-      # fat jar 与平台无关，任选一个 job 上传一次即可（Linux 最快）
-      - name: Stage universal fat jar
+      # universal jar 全平台通用，任选一个 job 补一次全平台构建上传即可（Linux 最快）；
+      # 同一工作区已 build 过平台 jar，必须 clean 重建，否则 shade 会把上一次的 fat jar 当输入叠加
+      - name: Build universal fat jar
         if: runner.os == 'Linux'
-        run: cp target/blackhole-lwjgl-*.jar "target/BlackHole-${ASSET_VER}-universal.jar"
+        run: |
+          mvn -B -ntp clean package
+          cp target/blackhole-lwjgl-*.jar "target/BlackHole-${ASSET_VER}-universal.jar"
 
       - name: Upload universal jar artifact
         if: runner.os == 'Linux'

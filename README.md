@@ -8,7 +8,8 @@
 ## 构建与运行
 
 ```bash
-mvn package                 # 产出 fat jar:target/blackhole-lwjgl-1.0-SNAPSHOT.jar(shade 替换主产物)
+mvn package                 # 产出 fat jar:target/blackhole-lwjgl-1.0-SNAPSHOT.jar(shade 替换主产物,含全平台 natives)
+mvn package -Dplatform=windows   # 瘦身 jar:只带单个平台 natives(可选 windows/linux/macos,CI 打平台包用)
 java -jar target/blackhole-lwjgl-1.0-SNAPSHOT.jar           # 正常运行
 java -jar target/blackhole-lwjgl-1.0-SNAPSHOT.jar --quiet   # 关闭应用自定义日志
 java -jar target/blackhole-lwjgl-1.0-SNAPSHOT.jar --verbose # 强制开启(优先级高于配置)
