@@ -1,5 +1,5 @@
 import org.joml.Vector3f;
-import vulkanb.eng.scene.GeodesicIntegrator;
+import io.github.preschoollerr.blackhole.eng.scene.GeodesicIntegrator;
 
 /**
  * 测地线积分器无头回归测试（无 GUI，可直接 main 运行）。
