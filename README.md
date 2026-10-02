@@ -18,7 +18,7 @@ java -jar target/blackhole-lwjgl-1.0-SNAPSHOT.jar --verbose # 强制开启(优�
 开发期直接运行（着色器按时间戳自动重编译，改 GLSL 免构建）：
 
 ```bash
-mvn compile exec:java -Dexec.mainClass=io.github.preschoollerr.blackhole.Main
+mvn compile exec:java -Dexec.mainClass=io.github.preschoolller.blackhole.Main
 ```
 
 依赖：支持 Vulkan 1.3 的 GPU/驱动。开发分支 `dev`，stable 合入 `main`；进行中的实验性功能在独立分支（如 `phase5-tetrad-camera`）。
@@ -81,7 +81,7 @@ GUI 面板：**Black Hole Telemetry**（只读遥测）/ **Controls**（时空�
 ## 源码结构
 
 ```
-src/main/java/io/github/preschoollerr/blackhole/
+src/main/java/io/github/preschoolller/blackhole/
 ├── Main.java                  # 入口(接口委托,保持精简)
 ├── eng/
 │   ├── EngCfg.java            # 双层配置加载(jar 内默认 + 外部覆盖)
