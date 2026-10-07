@@ -133,6 +133,17 @@ public class EngCfg {
     private boolean npgsPostChain;
     /** 噪声哈希查表开关（PerlinNoise sin 哈希 ↔ LUT texelFetch 实时 A/B） */
     private boolean kerrNoiseLut;
+    /** 六套 NPGS 天空盒惰性加载（六套解码 + mip 链约 480MB 显存；true 时只载默认选层
+     *  需要的 Background0/Antiground0，切到 1/2 号宇宙变体时按需补载） */
+    private boolean kerrLazySkybox;
+    /** iWhitehole：最大延拓（kerr.whitehole，默认关） */
+    private boolean kerrWhitehole;
+    /** iUniverseSign：相机所在空间侧 ±1（kerr.universeSign，默认 +1 正宇宙） */
+    private float kerrUniverseSign;
+    /** iDEBUG 初始值（kerr.debugMode 0..5；调试视图，见面板 Debug view） */
+    private int kerrDebugMode;
+    /** GUI 面板启动即隐藏（ui.hidden；F1 仍可随时切换显示） */
+    private boolean uiHidden;
     /** 山海星空盒开关（Antiverse0Skybox 纹理，两渲染器共用 DualSkybox 换绑，惰性加载） */
     private boolean mountainsSeasSkybox;
     /** iAccretionRate：吸积率（爱丁顿倍数）——驱动盘温标 */
@@ -283,6 +294,11 @@ public class EngCfg {
         npgsDirect = Boolean.parseBoolean(props.getOrDefault("npgs.direct", false).toString());
         npgsPostChain = Boolean.parseBoolean(props.getOrDefault("npgs.postChain", true).toString());
         kerrNoiseLut = Boolean.parseBoolean(props.getOrDefault("kerr.noiseLut", false).toString());
+        kerrLazySkybox = Boolean.parseBoolean(props.getOrDefault("kerr.lazySkybox", false).toString());
+        kerrWhitehole = Boolean.parseBoolean(props.getOrDefault("kerr.whitehole", false).toString());
+        kerrUniverseSign = Float.parseFloat(props.getOrDefault("kerr.universeSign", 1.0f).toString());
+        kerrDebugMode = Integer.parseInt(props.getOrDefault("kerr.debugMode", 0).toString());
+        uiHidden = Boolean.parseBoolean(props.getOrDefault("ui.hidden", false).toString());
         mountainsSeasSkybox = Boolean.parseBoolean(props.getOrDefault("skybox.mountainsSeas", false).toString());
         kerrAccretionRate = Float.parseFloat(props.getOrDefault("kerr.accretionRate", 0.01f).toString());
         kerrDiskOuterRadius = Float.parseFloat(props.getOrDefault("kerr.diskOuterRadius", 10.0f).toString());
@@ -535,6 +551,31 @@ public class EngCfg {
 
     public boolean isKerrNoiseLut() {
         return kerrNoiseLut;
+    }
+
+    /** 六套天空盒惰性加载开关（kerr.lazySkybox） */
+    public boolean isKerrLazySkybox() {
+        return kerrLazySkybox;
+    }
+
+    /** GUI 面板启动即隐藏（ui.hidden；F1 仍可切换） */
+    public boolean isUiHidden() {
+        return uiHidden;
+    }
+
+    /** iWhitehole 初始值（kerr.whitehole） */
+    public boolean isKerrWhitehole() {
+        return kerrWhitehole;
+    }
+
+    /** iDEBUG 初始值（kerr.debugMode 0..5，调试视图） */
+    public int getKerrDebugMode() {
+        return kerrDebugMode;
+    }
+
+    /** iUniverseSign 初始值（kerr.universeSign） */
+    public float getKerrUniverseSign() {
+        return kerrUniverseSign;
     }
 
     public boolean isMountainsSeasSkybox() {

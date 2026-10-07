@@ -1340,7 +1340,7 @@ public class NpgsRender {
           .putInt(kp.enableHeatHaze ? 1 : 0)  // iEnableHeatHaze
           .putInt(kp.shadowCulling ? 1 : 0)  // iEnableShadowCulling
           .putInt(geodesicActive ? -1 : 0)      // iObserverMode（-1=外传四维标架；0=静态观者）
-          .putInt(kp.polarization ? 1 : 0)   // iPolarization（偏振输出）
+          .putInt(kp.polarizationMode)   // iPolarization（0=关 / 1=EVPA 色相显示 / 2=马吕斯偏振片）
           .putInt(kp.useImageDisk ? 1 : 0);  // iUseImageDisk（贴图盘）
         // 37 个 float（顺序同 NPGS 声明）
 
