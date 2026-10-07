@@ -132,14 +132,23 @@ layout(set = 0, binding = 1) uniform BlackHoleArgs
     float iNoiseLut;                     //噪声哈希查表开关(本项目扩展字段,追加于 NPGS 布局末尾:0=程序化 sin 哈希,1=64³ LUT)
     float iDiskScatter;                  //盘前向散射强度(本项目扩展字段,追加于 NPGS 布局末尾:被盘消光的背景光散射回视线的比例,0=关)
     float iDiskAmbient;                  //盘环境光强度(本项目扩展字段,追加于 NPGS 布局末尾:全天空辐照×盘密度并入发射的弥散项,0=关)
+    // 落点白点开关（本项目扩展字段）：NPGS 原版此调用是注释状态（默认不画），本项目改为可开关。
+    // **占用 std140 结构对齐产生的尾部填充**（前面字段实际 396B、缓冲区 400B），故不改变任何
+    // 既有字段偏移，也不影响 NPGS 原版（其声明更短，自然忽略尾部字节）。
+    int iShowFallingDot;
 };
 
 layout(set = 1, binding = 0) uniform sampler2D iHistoryTex;
-// 单层天空盒（NPGS 共六套盒：Universe0/1/2 宇宙变体星空各面 1024² + Antiverse0/1/2 反宇宙
-// 各面 2048²，按 int(iInWhichUniverse+3+..)%3 选层——非分辨率 LOD；本项目 iInWhichUniverse
-// 恒 0 且 iWhitehole=0 → 恒选 0 号层，故裁为一套；恢复需先接线 iInWhichUniverse/白洞模式）
+// 六套天空盒（NPGS 逐字布局）：Universe0/1/2 宇宙变体星空 + Antiverse0/1/2 反宇宙，
+// 按 int(iInWhichUniverse+3+useContground)%3 选层——是"宇宙变体选层"而非分辨率 LOD。
+// useContground 由 Status 的高位（逃逸自上个宇宙的光，Status>3）反推，见 SampleBackground。
 layout(set = 1, binding = 1) uniform samplerCube iBackground0;
-// 贴图盘占位：iUseImageDisk 恒 0 不采样，仅保句柄合法（ImageDiskColor 未物理删除）
+layout(set = 1, binding = 2) uniform samplerCube iAntiground0;
+layout(set = 1, binding = 3) uniform samplerCube iBackground1;
+layout(set = 1, binding = 4) uniform samplerCube iAntiground1;
+layout(set = 1, binding = 5) uniform samplerCube iBackground2;
+layout(set = 1, binding = 6) uniform samplerCube iAntiground2;
+// 贴图盘（NPGS set1.b9，iUseImageDisk 开关控制采样；ImageDiskColor）
 layout(set = 1, binding = 9) uniform sampler2D iImageTexture;
 // 低分扭曲场（NPGS prepass/composite）：xyz=EscapeDir*FreqShift（频移编码进向量长度），
 // w=Status 状态位。全程 texelFetch 逐纹素取数，采样器滤波参数不参与
@@ -327,7 +336,36 @@ vec3 WavelengthToRgb(float wavelength) {
 // 单层天空盒采样：Status 的宇宙/反宇宙选层已裁剪（只有一套资源），仅保留三波段频移物理
 vec4 SampleBackground(vec3 Dir, float Shift, float Status)
 {
-    vec4 Backcolor = textureLod(iBackground0, Dir, 0.0);
+    // 六套盒选层（NPGS 逐行移植）：rStatus>3 表示光线逃逸自"上个宇宙"（最大延拓下穿过
+    // 虫洞喉道），偏移出一层；isAntiverse 判定落在反宇宙（Status=2,5,8…）。
+    // 取盒只按 iInWhichUniverse 选宇宙变体（0/1/2），与分辨率 LOD 无关。
+    // 与 NPGS 的唯一差异：此处固定 LOD 0（NPGS 用 textureQueryLod 逐面取 mip），
+    // 本移植版盒未生 mip 链，固定 0 既正确又省一次 LOD 查询。
+    vec4 Backcolor;
+
+    float rStatus = round(Status);
+    int offset = 0;
+    if (rStatus > 3.0) {
+        offset = int(round((rStatus - 1.0) / 3.0));
+    }
+    int useContground = -offset;
+
+    // Background 与 Antiground 的选层逻辑
+    bool isNegativeMass = (iBlackHoleMassSol < 0.0);
+    bool isAntiverse    = (mod(rStatus, 3.0) == 2.0); // 囊括 2, 5, 8… 所有反宇宙
+
+    if (isNegativeMass != isAntiverse)
+    {
+        if      (int(iInWhichUniverse+3+useContground)%3==0) Backcolor = textureLod(iAntiground0, Dir, 0.0);
+        else if (int(iInWhichUniverse+3+useContground)%3==1) Backcolor = textureLod(iAntiground1, Dir, 0.0);
+        else                                                 Backcolor = textureLod(iAntiground2, Dir, 0.0);
+    }
+    else
+    {
+        if      (int(iInWhichUniverse+3+useContground)%3==0) Backcolor = textureLod(iBackground0, Dir, 0.0);
+        else if (int(iInWhichUniverse+3+useContground)%3==1) Backcolor = textureLod(iBackground1, Dir, 0.0);
+        else                                                 Backcolor = textureLod(iBackground2, Dir, 0.0);
+    }
 
     float BackgroundShift = Shift;
     vec3 Rcolor = Backcolor.r * 1.0 * WavelengthToRgb(max(453.0, 645.0 / BackgroundShift));
@@ -791,14 +829,144 @@ void transformKerrSchild_YSpin(inout vec4 X, in float r_sign, inout vec4 P, in b
     P.z = - P_tilde.x * sin_a + P_tilde.z * cos_a;
     P.w = pt;                    // 能量 Pt 不变
 }
+// 调试函数：检查初始动量合法性并可视化局部动量方向
+// =============================================================================
+
+
+
+// =============================================================================
+// Walker-Penrose 常数计算 (无坐标奇点优化版)
+// 输入:
+//   X:     光子位置 (Cartesian KS, Y轴为自旋轴)
+//   P_cov: 光子下指标动量 P_mu
+//   F_cov: 光子下指标偏振 f_mu
+//   Physicala: 有量纲自旋参数（0.5a*）,M=0.5
+//   PhysicalQ: 有量纲电荷参数（0.5Q*）
+//   r:     由 KerrSchildRadius 算得的有符号半径
+// 返回:
+//   vec2:  Walker-Penrose 常数的 (实部, 虚部)
+// =============================================================================
+vec2 GetWalkerPenrose(vec4 X, vec4 P_cov, vec4 F_cov, float Physicala, float PhysicalQ, float r) {
+    // 提取坐标成分
+    float x = X.x;
+    float y = X.y;
+    float z = X.z;
+
+    // 提取下指标动量与偏振成分
+    float px = P_cov.x;
+    float py = P_cov.y;
+    float pz = P_cov.z;
+    float pt = P_cov.w; // 时间分量 P_t
+
+    float fx = F_cov.x;
+    float fy = F_cov.y;
+    float fz = F_cov.z;
+    float ft = F_cov.w; // 时间分量 F_t
+
+    // 由于 Kerr-Schild 坐标系的特殊性质，其复 Killing-Yano 张量的逆变分量 Y^uv
+    // 与平直时空完全相同（H l^u l^v 项的缩并严格为0）。
+    // 因此我们可以直接使用平直时空的逆变度规提升指标计算守恒量。
+    // 在度规 +++- 符号下，P^i = P_i, P^t = -P_t。
+
+    // 定义电型自旋向量 S_E^i = P^t F^i - F^t P^i = (-P_t) F_i - (-F_t) P_i = F_t P_i - P_t F_i
+    float S_Ex = ft * px - pt * fx;
+    float S_Ey = ft * py - pt * fy;
+    float S_Ez = ft * pz - pt * fz;
+
+    // 定义磁型自旋向量 S_B^i = (P \times F)^i (纯空间叉乘)
+    float S_Bx = py * fz - pz * fy;
+    float S_By = pz * fx - px * fz;
+    float S_Bz = px * fy - py * fx;
+
+    float a = Physicala;
+
+    // 自旋方向为 Y 轴，即 a 向量为 (0, a, 0)
+    // 根据平直时空 Y_uv P^u F^v 缩并推导：
+
+    // K_1 (实部) = - [ a \cdot S_E + r \cdot S_B ]
+    float K_re = -(a * S_Ey + x * S_Bx + y * S_By + z * S_Bz);
+
+    // K_2 (虚部) = - [ r \cdot S_E + a \cdot S_B ]
+    float K_im = -(x * S_Ex + y * S_Ey + z * S_Ez + a * S_By);
+
+    return vec2(K_re, K_im);
+}
+
+// =============================================================================
+// 解算偏振在相机屏幕上的二维投影 (科学严谨版：基于守恒律的投影归一化)
+// =============================================================================
+vec2 SolvePolarization(vec2 K_photon, vec2 K_right, vec2 K_up) {
+    float det = K_right.x * K_up.y - K_right.y * K_up.x;
+
+    // 降低退化阈值。在 Float32 下，det 可能会小到 1e-20 量级
+    if (abs(det) < 1e-25) {
+        return vec2(1.0, 0.0);
+    }
+
+    float inv_det = 1.0 / det;
+
+    float alpha = ( K_up.y * K_photon.x - K_up.x * K_photon.y) * inv_det;
+    float beta  = (-K_right.y * K_photon.x + K_right.x * K_photon.y) * inv_det;
+
+    vec2 result = vec2(alpha, beta);
+
+    // 【核心修复】：物理守恒律约束
+    // 平行移动保持极化矢量的模长不变。因为发射点和相机处的极化基底均已归一化，
+    // 理论上必定有 alpha^2 + beta^2 = 1。
+    // Float32 在处理趋近径向光线的 WP 常数时发生灾难性相消，导致振幅失真甚至爆炸。
+    // 在此将结果重新归一化，既消除了数值发散，又保留了精确的偏振方向（相位）信息。
+    float mag = length(result);
+    if (mag > 1e-19) {
+        result /= mag;
+    } else {
+        // 如果连方向都被噪声完全摧毁(极其罕见)，指定一个默认方向
+        result = vec2(1.0, 0.0);
+    }
+
+    return result;
+}
+
+
+// =============================================================================
+// 由观测者四维速度 U_up 与光子上指标动量 P_up，把两个候选矢量 (Right/Up)
+// 正交化成与光子动量横向的四维偏振矢量 F_down（满足 F·P = 0、F·F = 1）。
+// 投影算子取 (P_up - P_up·U_down · U_up)：因为 D ≡ P + E·U（E = -P·U）与
+// P - (P·U)U 只差整体符号，而归一化后符号无影响；故此处形式最简且无需显式求 E。
+// 仅 iPolarization != 0 时被调用。
+// =============================================================================
+void BuildTransversePolarizationBasis(vec4 P_cov_base, vec4 U_up, vec4 U_down, KerrGeometry geo,
+                                      vec4 Right_up, vec4 Up_up,
+                                      out vec4 FX_down, out vec4 FY_down) {
+    vec4 P_up = RaiseIndex(P_cov_base, geo);
+
+    vec4 D_up   = P_up - dot(P_up, U_down) * U_up;
+    vec4 D_down = LowerIndex(D_up, geo);
+    float invE2 = 1.0 / max(1e-12, dot(P_up, U_down) * dot(P_up, U_down));
+
+    vec4 FX_up = Right_up - (dot(Right_up, D_down) * invE2) * D_up;
+    vec4 FY_up = Up_up    - (dot(Up_up,    D_down) * invE2) * D_up;
+
+    FX_down = LowerIndex(FX_up, geo);
+    FY_down = LowerIndex(FY_up, geo);
+
+    FX_down /= sqrt(max(1e-12, dot(FX_up, FX_down)));
+    FY_down /= sqrt(max(1e-12, dot(FY_up, FY_down)));
+}
+
 //初始化ingoing系下光子动量P_u，以向心矢量为主轴做施密特正交化
 vec4 GetInitialMomentum(
     vec3 RayDir,          
     vec4 X,               
     float GravityFade,
-    bool isOutgoing
+    bool isOutgoing,
+    out vec2 WP_CamX_out,   // 偏振基底：相机屏幕 right 轴的 Walker-Penrose 常数（仅 iPolarization≠0 写入）
+    out vec2 WP_CamY_out    // 偏振基底：相机屏幕 up 轴的 Walker-Penrose 常数（仅 iPolarization≠0 写入）
 )
 {
+    // 默认零基底：iPolarization==0 时下游不使用，iObserverMode==-1 分支单独处理
+    WP_CamX_out = vec2(0.0);
+    WP_CamY_out = vec2(0.0);
+
     float universesign = iUniverseSign;
     if (iObserverMode == -1) {
         // 在 C++ 中，RayDir传入的是 ViewDirLocal（屏幕视锥方向）
@@ -825,7 +993,20 @@ vec4 GetInitialMomentum(
             vec4 dummyX = X;
             transformKerrSchild_YSpin(dummyX, universesign, P_cov_cam, isOutgoing);
         }
-        
+
+        // 偏振基底（四维标架观者）：宿主 ie1/2_up = 相机 (right, up) 方向，
+        // 用与静态观者分支相同的四维 Gram-Schmidt 造横向偏振矢量。
+        if (iPolarization != 0) {
+            // U_up（四维速度）在该分支由宿主的 iU_up 提供
+            vec4 FX_down, FY_down;
+            BuildTransversePolarizationBasis(P_cov_cam, iU_up, LowerIndex(iU_up, geo_cam), geo_cam,
+                                             ie1_up, ie2_up, FX_down, FY_down);
+
+            float r_start = KerrSchildRadius(X.xyz, universesign);
+            WP_CamX_out = GetWalkerPenrose(X, P_cov_cam, FX_down, PhysicalSpinA, PhysicalQ, r_start);
+            WP_CamY_out = GetWalkerPenrose(X, P_cov_cam, FY_down, PhysicalSpinA, PhysicalQ, r_start);
+        }
+
         return P_cov_cam;
     }
     KerrGeometry geo;
@@ -954,28 +1135,20 @@ vec4 GetInitialMomentum(
 
     vec4 P_up = U_up - (k_r * e1 + k_theta * e2 + k_phi * e3);
 
+    if (iPolarization != 0) {
+        // e3/e2 作为相机屏幕的 right/up 参考轴（与 NPGS 的 R_up/Y_up 语义一致）
+        vec4 FX_down, FY_down;
+        BuildTransversePolarizationBasis(LowerIndex(P_up, geo), U_up, U_down, geo, e3, e2, FX_down, FY_down);
+
+        // 输出到调用方作用域的偏振基底（out 参数，避免全局变量状态污染）
+        WP_CamX_out = GetWalkerPenrose(X, LowerIndex(P_up, geo), FX_down, PhysicalSpinA, PhysicalQ, geo.r);
+        WP_CamY_out = GetWalkerPenrose(X, LowerIndex(P_up, geo), FY_down, PhysicalSpinA, PhysicalQ, geo.r);
+    }
+
     // 返回协变动量 P_mu
     return LowerIndex(P_up, geo);
 }
 // =============================================================================
-// 调试函数：检查初始动量合法性并可视化局部动量方向
-// =============================================================================
-
-
-
-// =============================================================================
-// Walker-Penrose 常数计算 (无坐标奇点优化版)
-// 输入:
-//   X:     光子位置 (Cartesian KS, Y轴为自旋轴)
-//   P_cov: 光子下指标动量 P_mu
-//   F_cov: 光子下指标偏振 f_mu
-//   Physicala: 有量纲自旋参数（0.5a*）,M=0.5
-//   PhysicalQ: 有量纲电荷参数（0.5Q*）
-//   r:     由 KerrSchildRadius 算得的有符号半径
-// 返回:
-//   vec2:  Walker-Penrose 常数的 (实部, 虚部)
-// =============================================================================
-
 
 // =============================================================================
 // 5.积分器
@@ -1717,6 +1890,46 @@ vec4 DiskColor(vec4 BaseColor, vec4 RayPos, vec4 LastRayPos,
 
                      vec4 StepColor = SampleColor * StepSize;
 
+                     // =========================================================
+                     // 偏振积累（NPGS 逐行移植）：以盘内磁场方向 B 与流体四速 u 构造
+                     // 发射偏振矢量 f，投影到相机屏幕基底（WP 常数）后累积 Stokes Q/U。
+                     // 最终由 TraceRay 尾部按 iPolarization（1=色相显示 / 2=偏振片）消费。
+                     // =========================================================
+                     if (iPolarization != 0) {
+                         float chi = -0.7;
+                         float cosChi = cos(chi);
+                         float sinChi = sin(chi);
+
+                         vec4 B_tor = vec4(-SamplePos.z, 0.0, SamplePos.x, 0.0);
+                         vec4 B_rad = vec4(SamplePos.x, SamplePos.y, SamplePos.z, 0.0);
+                         vec4 B_up = normalize(B_tor) * cosChi + normalize(B_rad) * sinChi;
+                         B_up.w = 0.0;
+
+                         vec4 u_up_fluid = vec4(AngularVelocity * (-SamplePos.z), 0.0,
+                                                AngularVelocity * SamplePos.x, 1.0) * u_t;
+
+                         vec4 p_up = Sample_P_up;
+
+                         vec4 f_down;
+                         f_down.x =  det3(u_up_fluid.yzw, p_up.yzw, B_up.yzw);
+                         f_down.y = -det3(u_up_fluid.xzw, p_up.xzw, B_up.xzw);
+                         f_down.z =  det3(u_up_fluid.xyw, p_up.xyw, B_up.xyw);
+                         f_down.w = -det3(u_up_fluid.xyz, p_up.xyz, B_up.xyz);
+
+                         float f_norm = sqrt(max(1e-12, abs(dot(RaiseIndex(f_down, geo_emit), f_down))));
+                         f_down /= f_norm;
+
+                         vec4 Emit_X = vec4(SamplePos, EmissionTime);
+                         vec2 WP_emit = GetWalkerPenrose(Emit_X, Sample_P_cov, f_down,
+                                                         PhysicalSpinA, PhysicalQ, PosR);
+
+                         vec2 ScreenAmps = SolvePolarization(WP_emit, WP_CamX, WP_CamY);
+
+                         float weight = (SampleColor.r + SampleColor.g + SampleColor.b) * StepSize
+                                      * pow(1.0 - CurrentResult.a, 1.0);
+                         StokesQU.x += (ScreenAmps.x * ScreenAmps.x - ScreenAmps.y * ScreenAmps.y) * weight;
+                         StokesQU.y += (2.0 * ScreenAmps.x * ScreenAmps.y) * weight;
+                     }
 
                      float aR = 1.0 + Reddening * (1.0 - 1.0);
                      float aG = 1.0 + Reddening * (3.0 - 1.0);
@@ -1752,7 +1965,8 @@ vec4 DiskColor(vec4 BaseColor, vec4 RayPos, vec4 LastRayPos,
 vec4 JetColor(vec4 BaseColor, vec4 RayPos, vec4 LastRayPos,
               vec4 iP_cov, vec4 lastiP_cov, float iE_obs,
               bool isoutgoing,
-              inout float RayMarchPhase 
+              inout float RayMarchPhase,
+              vec2 WP_CamX, vec2 WP_CamY, inout vec2 StokesQU
               ) 
 {
     float InterRadius = iInterRadiusRs;
@@ -1899,6 +2113,7 @@ vec4 JetColor(vec4 BaseColor, vec4 RayPos, vec4 LastRayPos,
                 KerrGeometry geo_sample;
                 // 注意：isoutgoing 必须填 false，因为我们已经在上文将其统一转换为了 Ingoing 坐标
                 ComputeGeometryScalars(SamplePos, 1.0, 1.0, false, geo_sample);
+
                 
                 // 物理喷流速度 0.8c, 洛伦兹因子 Gamma = 1/sqrt(1 - 0.8^2) = 1.6666667
                 float v_jet = 0.8;
@@ -1961,6 +2176,48 @@ vec4 JetColor(vec4 BaseColor, vec4 RayPos, vec4 LastRayPos,
                     float cMin = min(min(AccumColor.r, AccumColor.g), AccumColor.b);
                     AccumColor.rgb = vec3(cMax + cMin) - AccumColor.rgb;
                 }
+                // =========================================================
+                // 偏振积累（NPGS 逐行移植，与 DiskColor 同构）：喷流四速 U_jet 与其
+                // 位置径向/环向合成磁场方向构造发射偏振矢量 f，投影到相机屏幕基底
+                // 后累积 Stokes Q/U（供 TraceRay 尾部 iPolarization 分支消费）。
+                // =========================================================
+                if (iPolarization != 0) {
+                    float chi = -0.7;
+                    float cosChi = cos(chi);
+                    float sinChi = sin(chi);
+
+                    vec4 B_tor = vec4(-SamplePos.z, 0.0, SamplePos.x, 0.0);
+                    vec4 B_rad = vec4(SamplePos.x, SamplePos.y, SamplePos.z, 0.0);
+                    vec4 B_up = normalize(B_tor) * cosChi + normalize(B_rad) * sinChi;
+                    B_up.w = 0.0;
+
+                    // 喷流轴向为 Y：用其空间速度构造流体四速（时间分量暂置 1，由归一化吸收）
+                    vec4 u_up_fluid = vec4(U_spatial, 1.0) * Ut;
+
+                    // 采样点光子上指标动量（喷射分支独立于盘分支，须自行提升指标）
+                    vec4 Sample_P_up = RaiseIndex(Sample_P_cov, geo_sample);
+                    vec4 p_up = Sample_P_up;
+
+                    vec4 f_down;
+                    f_down.x =  det3(u_up_fluid.yzw, p_up.yzw, B_up.yzw);
+                    f_down.y = -det3(u_up_fluid.xzw, p_up.xzw, B_up.xzw);
+                    f_down.z =  det3(u_up_fluid.xyw, p_up.xyw, B_up.xyw);
+                    f_down.w = -det3(u_up_fluid.xyz, p_up.xyz, B_up.xyz);
+
+                    float f_norm = sqrt(max(1e-12, abs(dot(RaiseIndex(f_down, geo_sample), f_down))));
+                    f_down /= f_norm;
+
+                    vec4 Emit_X = vec4(SamplePos, EmissionTime);
+                    vec2 WP_emit = GetWalkerPenrose(Emit_X, Sample_P_cov, f_down,
+                                                    PhysicalSpinA, PhysicalQ, PosR);
+
+                    vec2 ScreenAmps = SolvePolarization(WP_emit, WP_CamX, WP_CamY);
+
+                    float weight = (AccumColor.r + AccumColor.g + AccumColor.b) * StepSize
+                                 * pow(1.0 - CurrentResult.a, 1.0);
+                    StokesQU.x += (ScreenAmps.x * ScreenAmps.x - ScreenAmps.y * ScreenAmps.y) * weight;
+                    StokesQU.y += (2.0 * ScreenAmps.x * ScreenAmps.y) * weight;
+                }
 
                 // ... (颜色累加不变)
                 float aR = 1.0 + JetReddening * (1.0 - 1.0);
@@ -2006,11 +2263,1282 @@ vec4 JetColor(vec4 BaseColor, vec4 RayPos, vec4 LastRayPos,
 // =====================================================================
 
 
-// [Phase 1.5] Shadow-culling helper stubs — return 0 (shadow culling disabled until functions are restored)
-float SolveCubicMaxReal(float P, float K) { return 0.0; }
-float SolveQuarticU(float M, float Q, float a, float sign_term, bool is_max_root) { return 0.0; }
-float GetDropFrameAngle(float SinThetaStat, float CosThetaStat, float r, float M, float Q, float a, int ObserverMode) { return 0.0; }
-float GetShadowHalfAngleRN(float r, float M, float Q, int ObserverMode) { return 0.0; }
+// =============================================================================
+// 时空网格（NPGS 逐行移植）：iGrid=1 → GridColor（真实的当前步坐标），
+// iGrid=2 → GridColorSimple（简易版，接受 ShowInnerGrid 遮罩）。两者均不依赖
+// 外部辅助函数，属自包含实现；由 TraceRay 主循环按 iGrid 分派调用。
+// =============================================================================
+vec4 GridColorSimple(vec4 BaseColor, vec4 RayPos, vec4 LastRayPos,
+               vec4 P_cov, vec4 LastP_cov, 
+               float PhysicalSpinA, float PhysicalQ, bool isoutgoing,
+               float EndStepSign, float dlambda,bool showInnerGrid)
+               {
+    vec4 CurrentResult = BaseColor;
+    if (CurrentResult.a > 0.99) return CurrentResult;
+
+    const int MaxGrids = 5; 
+    
+    float SignedGridRadii[MaxGrids]; 
+    vec3  GridColors[MaxGrids];
+    int   GridCount = 0;
+    
+    float StartStepSign = EndStepSign;
+    bool bHasCrossed = false;
+    float t_cross = -1.0;
+    vec3 DiskHitPos = vec3(0.0);
+    vec4 DiskHitX = vec4(0.0); // 新增：用于记录赤道盘相交时的四维坐标信息
+
+    // --- 【修改 2：计算端点坐标速度与 Hermite 曲线切线】 ---
+    // 获取起点和终点的几何信息并升指标，求出坐标对仿射参量的导数 dX/dlambda
+    KerrGeometry geo_last;
+    ComputeGeometryScalars(LastRayPos.xyz, 1.0, StartStepSign, isoutgoing, geo_last);
+    vec4 V0 = RaiseIndex(LastP_cov, geo_last); 
+    vec4 T0 = V0 * dlambda; // 转换为对插值参数 t(0~1) 的导数
+
+    KerrGeometry geo_curr;
+    ComputeGeometryScalars(RayPos.xyz, 1.0, EndStepSign, isoutgoing, geo_curr);
+    vec4 V1 = RaiseIndex(P_cov, geo_curr);     
+    vec4 T1 = V1 * dlambda; 
+
+// --- 【修改 3：赤道盘相交改为三次曲线求根】 ---
+    if (LastRayPos.y * RayPos.y < 0.0) {
+        float denom = (LastRayPos.y - RayPos.y);
+        if(abs(denom) > 1e-9) {
+            t_cross = LastRayPos.y / denom; // 线性初猜
+            
+            // 牛顿迭代求三次 Hermite 曲线在 y 轴的精确零点
+            for(int iter = 0; iter < 3; iter++) {
+                float t2 = t_cross * t_cross;
+                float t3 = t2 * t_cross;
+                
+                // 基函数
+                float h00 = 2.0*t3 - 3.0*t2 + 1.0;
+                float h10 = t3 - 2.0*t2 + t_cross;
+                float h01 = -2.0*t3 + 3.0*t2;
+                float h11 = t3 - t2;
+                float yt = h00*LastRayPos.y + h10*T0.y + h01*RayPos.y + h11*T1.y;
+                
+                // 导数
+                float dh00 = 6.0*t2 - 6.0*t_cross;
+                float dh10 = 3.0*t2 - 4.0*t_cross + 1.0;
+                float dh01 = -6.0*t2 + 6.0*t_cross;
+                float dh11 = 3.0*t2 - 2.0*t_cross;
+                float dyt = dh00*LastRayPos.y + dh10*T0.y + dh01*RayPos.y + dh11*T1.y;
+                
+                t_cross -= yt / (dyt + 1e-12);
+            }
+            t_cross = clamp(t_cross, 0.0, 1.0);
+            
+            // 依据精确 t 计算交点四维坐标
+            float t2 = t_cross * t_cross;
+            float t3 = t2 * t_cross;
+            vec4 H = vec4(2.0*t3 - 3.0*t2 + 1.0, t3 - 2.0*t2 + t_cross, -2.0*t3 + 3.0*t2, t3 - t2);
+            DiskHitX = H.x*LastRayPos + H.y*T0 + H.z*RayPos + H.w*T1;
+            DiskHitPos = DiskHitX.xyz;
+            
+            if (length(DiskHitPos.xz) < abs(PhysicalSpinA)) {
+                StartStepSign = -EndStepSign;
+                bHasCrossed = true;
+            }
+        }
+    }
+    // ---------------------------------------------
+
+    bool CheckPositive = (StartStepSign > 0.0) || (EndStepSign > 0.0);
+    bool CheckNegative = (StartStepSign < 0.0) || (EndStepSign < 0.0);
+
+    float HorizonDiscrim = 0.25 - PhysicalSpinA * PhysicalSpinA - PhysicalQ * PhysicalQ;
+    float RH_Outer = 0.5 + sqrt(max(0.0, HorizonDiscrim));
+    float RH_Inner = 0.5 - sqrt(max(0.0, HorizonDiscrim));
+    bool HasHorizon = HorizonDiscrim >= 0.0;
+
+    if (CheckPositive) {
+        SignedGridRadii[GridCount] = 70.0;
+        GridColors[GridCount] = 0.3*vec3(0.0, 1.0, 1.0); 
+        GridCount++;
+
+        if (HasHorizon) {
+            SignedGridRadii[GridCount] = RH_Outer * 1.06; 
+            GridColors[GridCount] = 0.3*vec3(0.0, 1.0, 0.0); 
+            GridCount++;
+            if(showInnerGrid)
+            {
+                SignedGridRadii[GridCount] = RH_Inner * 0.94; 
+                GridColors[GridCount] =0.3* vec3(1.0, 0.0, 0.0); 
+                GridCount++;
+            }
+        }
+    }
+    
+    if (CheckNegative) {
+        SignedGridRadii[GridCount] = -70.0;  
+        GridColors[GridCount] = 0.3*vec3(1.0, 0.0, 1.0); 
+        GridCount++;
+    }
+
+    vec3 O = LastRayPos.xyz;
+    vec3 D_vec = RayPos.xyz - LastRayPos.xyz;
+
+    for (int i = 0; i < GridCount; i++) {
+        if (CurrentResult.a > 0.99) break;
+
+        float TargetSignedR = SignedGridRadii[i];
+        float TargetGeoR = abs(TargetSignedR); 
+        vec3  TargetColor = GridColors[i];
+
+        vec2 roots = IntersectKerrEllipsoid(O, D_vec, TargetGeoR, PhysicalSpinA);
+        
+        float t_hits[2];
+        t_hits[0] = roots.x;
+        t_hits[1] = roots.y;
+        if (t_hits[0] > t_hits[1]) {
+            float temp = t_hits[0]; t_hits[0] = t_hits[1]; t_hits[1] = temp;
+        }
+        
+        for (int j = 0; j < 2; j++) {
+            float t = t_hits[j];
+            
+            if (t >= 0.0 && t <= 1.0) {
+                
+                float HitPointSign = StartStepSign;
+                if (bHasCrossed) {
+                    if (t > t_cross) {
+                        HitPointSign = EndStepSign;
+                    }
+                }
+
+                if (HitPointSign * TargetSignedR < 0.0) continue;
+
+                // --- 【修改 4：曲线与椭球网格面相交的牛顿迭代修整】 ---
+                for(int iter = 0; iter < 2; iter++) {
+                    float t2 = t*t; float t3 = t2*t;
+                    vec4 H = vec4(2.0*t3 - 3.0*t2 + 1.0, t3 - 2.0*t2 + t, -2.0*t3 + 3.0*t2, t3 - t2);
+                    vec3 pos = (H.x*LastRayPos + H.y*T0 + H.z*RayPos + H.w*T1).xyz;
+                    float curR = KerrSchildRadius(pos, HitPointSign);
+                    
+                    // 数值导数
+                    float dt = 0.001;
+                    float nt = t + dt;
+                    float nt2 = nt*nt; float nt3 = nt2*nt;
+                    vec4 nH = vec4(2.0*nt3 - 3.0*nt2 + 1.0, nt3 - 2.0*nt2 + nt, -2.0*nt3 + 3.0*nt2, nt3 - nt2);
+                    vec3 npos = (nH.x*LastRayPos + nH.y*T0 + nH.z*RayPos + nH.w*T1).xyz;
+                    float nextR = KerrSchildRadius(npos, HitPointSign);
+                    
+                    float dr_dt = (nextR - curR) / dt;
+                    t -= (curR - TargetSignedR) / (dr_dt + 1e-12);
+                }
+                
+                if (t < 0.0 || t > 1.0) continue; 
+                
+                // 依据精确 t 提取四维坐标
+                float t2 = t*t; float t3 = t2*t;
+                vec4 H = vec4(2.0*t3 - 3.0*t2 + 1.0, t3 - 2.0*t2 + t, -2.0*t3 + 3.0*t2, t3 - t2);
+                vec4 HitX = H.x*LastRayPos + H.y*T0 + H.z*RayPos + H.w*T1;
+                
+                vec3 HitPos = HitX.xyz;
+                float HitTime = HitX.w;
+                // ----------------------------------------------------
+                
+                float CheckR = KerrSchildRadius(HitPos, HitPointSign);
+                if (abs(CheckR - TargetSignedR) > 0.1 * TargetGeoR + 0.1) continue; 
+
+                // 动量在此保持线性插值即可（已足够准确用于后续投影运算）
+                vec4 HitP_cov = mix(LastP_cov, P_cov, t);
+                // --- 几何图案部分：将坐标映射回统一的 Ingoing 参考系 ---
+                vec3 PatternPos = HitPos;
+                float PatternTime = HitTime;
+                if (isoutgoing) {
+                    vec4 tempX = vec4(HitPos, HitTime);
+                    vec4 dummyP = vec4(0.0);
+                    transformKerrSchild_YSpin(tempX, HitPointSign, dummyP, true);
+                    PatternPos = tempX.xyz;
+                    PatternTime = tempX.w;
+                }
+
+                float Omega = GetZamoOmega(TargetSignedR, PhysicalSpinA, PhysicalQ, PatternPos.y);
+
+                float Phi_raw = Vec2ToTheta(normalize(PatternPos.zx), vec2(0.0, 1.0));
+                float Phi = Phi_raw + Omega * PatternTime + iBlackHoleTime*GetZamoOmega(TargetSignedR, PhysicalSpinA, PhysicalQ, 0.0);
+                
+                float CosTheta = clamp(PatternPos.y / TargetGeoR, -1.0, 1.0);
+                float Theta = acos(CosTheta);
+                float SinTheta = sqrt(max(0.0, 1.0 - CosTheta * CosTheta));
+
+                float DensityPhi = 24.0;
+                float DensityTheta = 13.0;
+                float DistFactor = min(20.0,length(PatternPos));
+                float LineWidth = 0.002 * DistFactor; 
+                LineWidth = clamp(LineWidth, 0.01, 0.15); 
+
+                float PatternPhi = abs(fract(Phi / (2.0 * kPi) * DensityPhi) - 0.5);
+                float GridPhi = smoothstep(LineWidth / max(0.005, SinTheta), 0.0, PatternPhi);
+
+                float PatternTheta = abs(fract(Theta / kPi * DensityTheta) - 0.5);
+                float GridTheta = smoothstep(LineWidth, 0.0, PatternTheta);
+                
+                float GridIntensity = max(GridPhi, GridTheta);
+
+                // --- 【修改：新增计算网格点局部能量】 ---
+                float Omega_zamo = GetZamoOmega(TargetSignedR, PhysicalSpinA, PhysicalQ, HitPos.y);
+                vec3 VelSpatial = Omega_zamo * vec3(HitPos.z, 0.0, -HitPos.x);
+                vec4 U_zamo_unnorm = vec4(VelSpatial, 1.0); 
+                KerrGeometry geo_hit;
+                ComputeGeometryScalars(HitPos, 1.0, HitPointSign, isoutgoing, geo_hit);
+                vec4 U_zamo_lower = LowerIndex(U_zamo_unnorm, geo_hit);
+                float norm_sq = dot(U_zamo_unnorm, U_zamo_lower);
+                float norm = sqrt(max(1e-9, abs(norm_sq)));
+                vec4 U_zamo = U_zamo_unnorm / norm;
+                float E_emit = -dot(HitP_cov, U_zamo);
+                // ------------------------------------
+
+                if (GridIntensity > 0.01) {
+                    vec4 GridCol = vec4(TargetColor * 2.0, 1.0);
+                    
+                    // --- 【修改：新增负能量判断与反色/剔除逻辑】 ---
+                    if (E_emit < 0.0) {
+                        float cMax = max(max(GridCol.r, GridCol.g), GridCol.b);
+                        float cMin = min(min(GridCol.r, GridCol.g), GridCol.b);
+                        GridCol.rgb = vec3(cMax + cMin) - GridCol.rgb;
+                        if (iWhitehole == 0) GridCol.rgba = vec4(0.0);
+                    }
+                    // -----------------------------------------
+                    
+                    float Alpha = GridIntensity * 0.8; 
+                    CurrentResult.rgb += GridCol.rgb * Alpha * (1.0 - CurrentResult.a);
+                    CurrentResult.a   += Alpha * (1.0 - CurrentResult.a);
+                }
+            }
+        }
+    }
+
+    if (bHasCrossed && CurrentResult.a < 0.99) {
+        
+        float HitRho = length(DiskHitPos.xz);
+        float a_abs = abs(PhysicalSpinA);
+        float HitTime_disk = DiskHitX.w;
+        vec4 HitP_cov = mix(LastP_cov, P_cov, t_cross);
+        // --- 提取统一网格相位的偏移 ---
+        vec3 PatternPosDisk = DiskHitPos;
+        if (isoutgoing) {
+            vec4 tempX = vec4(DiskHitPos, HitTime_disk);
+            vec4 dummyP = vec4(0.0);
+            float diskSign = (length(DiskHitPos.xz) < abs(PhysicalSpinA)) ? -StartStepSign : StartStepSign;
+            transformKerrSchild_YSpin(tempX, diskSign, dummyP, true);
+            PatternPosDisk = tempX.xyz;
+        }
+
+        float Phi_raw = Vec2ToTheta(normalize(PatternPosDisk.zx), vec2(0.0, 1.0));
+        float Phi = Phi_raw;
+        
+        float DensityPhi = 24.0;
+        float DistFactor = length(DiskHitPos); 
+        float LineWidth = 0.002 * DistFactor;
+        LineWidth = clamp(LineWidth, 0.01, 0.1);
+
+        float PatternPhi = abs(fract(Phi / (2.0 * kPi) * DensityPhi) - 0.5);
+        float GridPhi = smoothstep(LineWidth / max(0.1, HitRho / a_abs), 0.0, PatternPhi);
+
+        float NormalizedRho = HitRho / max(1e-6, a_abs);
+        float DensityRho = 5.0; 
+        float PatternRho = abs(fract(NormalizedRho * DensityRho) - 0.5);
+        float GridRho = smoothstep(LineWidth, 0.0, PatternRho);
+        
+        float GridIntensity = max(GridPhi, GridRho);
+
+        // --- 【修改：新增计算静态能量投影】 ---
+        vec4 U_zero = vec4(0.0, 0.0, 0.0, 1.0); 
+        float E_emit_disk = -dot(HitP_cov, U_zero); 
+        // ---------------------------------
+
+        if (GridIntensity > 0.01) {
+            vec3 RingColor = 0.3*vec3(1.0, 1.0, 1.0);
+            vec4 GridCol = vec4(RingColor * 5.0, 1.0);
+            
+            // --- 【修改：新增负能量判断与反色/剔除逻辑】 ---
+            if (E_emit_disk < 0.0) {
+                float cMax = max(max(GridCol.r, GridCol.g), GridCol.b);
+                float cMin = min(min(GridCol.r, GridCol.g), GridCol.b);
+                GridCol.rgb = vec3(cMax + cMin) - GridCol.rgb;
+                if (iWhitehole == 0) GridCol.rgba = vec4(0.0);
+            }
+            // -----------------------------------------
+            
+            float Alpha = GridIntensity * 0.8;
+            CurrentResult.rgb += GridCol.rgb * Alpha * (1.0 - CurrentResult.a);
+            CurrentResult.a   += Alpha * (1.0 - CurrentResult.a);
+        }
+    }
+
+    return CurrentResult;
+}
+
+vec4 GridColor(vec4 BaseColor, vec4 RayPos, vec4 LastRayPos,
+               vec4 iP_cov, float iE_obs,
+               float PhysicalSpinA, float PhysicalQ, bool isoutgoing,
+               float EndStepSign)
+{
+    vec4 CurrentResult = BaseColor;
+    if (CurrentResult.a > 0.99) return CurrentResult;
+
+    const int MaxGrids = 12; 
+    float SignedGridRadii[MaxGrids]; 
+    int GridCount = 0;
+    
+    float StartStepSign = EndStepSign;
+    bool bHasCrossed = false;
+    float t_cross = -1.0;
+    vec3 DiskHitPos = vec3(0.0);
+    
+    if (LastRayPos.y * RayPos.y < 0.0) {
+        float denom = (LastRayPos.y - RayPos.y);
+        if(abs(denom) > 1e-9) {
+            t_cross = LastRayPos.y / denom;
+            DiskHitPos = mix(LastRayPos.xyz, RayPos.xyz, t_cross);
+            
+            if (length(DiskHitPos.xz) < abs(PhysicalSpinA)) {
+                StartStepSign = -EndStepSign;
+                bHasCrossed = true;
+            }
+        }
+    }
+
+    bool CheckPositive = (StartStepSign > 0.0) || (EndStepSign > 0.0);
+    bool CheckNegative = (StartStepSign < 0.0) || (EndStepSign < 0.0);
+
+    float HorizonDiscrim = 0.25 - PhysicalSpinA * PhysicalSpinA - PhysicalQ * PhysicalQ;
+    float RH_Outer = 0.5 + sqrt(max(0.0, HorizonDiscrim));
+    float RH_Inner = 0.5 - sqrt(max(0.0, HorizonDiscrim));
+
+    if (CheckPositive) {
+        SignedGridRadii[GridCount++] = RH_Outer * 1.06; 
+        SignedGridRadii[GridCount++] = 20.0;
+        
+        if (HorizonDiscrim >= 0.0) {
+           SignedGridRadii[GridCount++] = RH_Inner * 0.94; 
+        }
+    }
+    
+    if (CheckNegative) {
+        SignedGridRadii[GridCount++] = -3.0;  
+        SignedGridRadii[GridCount++] = -10.0; 
+    }
+
+    vec3 O = LastRayPos.xyz;
+    vec3 D_vec = RayPos.xyz - LastRayPos.xyz;
+
+    for (int i = 0; i < GridCount; i++) {
+        if (CurrentResult.a > 0.99) break;
+
+        float TargetSignedR = SignedGridRadii[i];
+        float TargetGeoR = abs(TargetSignedR); 
+
+        vec2 roots = IntersectKerrEllipsoid(O, D_vec, TargetGeoR, PhysicalSpinA);
+        
+        float t_hits[2];
+        t_hits[0] = roots.x;
+        t_hits[1] = roots.y;
+        
+        if (t_hits[0] > t_hits[1]) {
+            float temp = t_hits[0]; t_hits[0] = t_hits[1]; t_hits[1] = temp;
+        }
+        
+        for (int j = 0; j < 2; j++) {
+            float t = t_hits[j];
+            
+            if (t >= 0.0 && t <= 1.0) {
+                
+                float HitPointSign = StartStepSign;
+                if (bHasCrossed) {
+                    if (t > t_cross) {
+                        HitPointSign = EndStepSign;
+                    }
+                }
+
+                if (HitPointSign * TargetSignedR < 0.0) continue;
+
+                vec3 HitPos = O + D_vec * t;
+                float CheckR = KerrSchildRadius(HitPos, HitPointSign);
+                if (abs(CheckR - TargetSignedR) > 0.1 * TargetGeoR + 0.1) continue; 
+
+                float HitTime = mix(LastRayPos.w, RayPos.w, t);
+
+                // --- 物理计算部分：维持在当前的平滑坐标系（ HitPos 和 isoutgoing ）---
+                float Omega = GetZamoOmega(TargetSignedR, PhysicalSpinA, PhysicalQ, HitPos.y);
+                vec3 VelSpatial = Omega * vec3(HitPos.z, 0.0, -HitPos.x);
+                vec4 U_zamo_unnorm = vec4(VelSpatial, 1.0); 
+                
+                KerrGeometry geo_hit;
+                ComputeGeometryScalars(HitPos, 1.0, HitPointSign, isoutgoing, geo_hit);
+                
+                vec4 U_zamo_lower = LowerIndex(U_zamo_unnorm, geo_hit);
+                float norm_sq = dot(U_zamo_unnorm, U_zamo_lower);
+                float norm = sqrt(max(1e-9, abs(norm_sq)));
+                vec4 U_zamo = U_zamo_unnorm / norm;
+
+                float E_emit = -dot(iP_cov, U_zamo);
+                float Shift = 1.0/ max(1e-6, abs(E_emit)); 
+
+                // --- 几何图案部分：将坐标映射回统一的 Ingoing 参考系 ---
+                vec3 PatternPos = HitPos;
+                float PatternTime = HitTime;
+                if (isoutgoing) {
+                    vec4 tempX = vec4(HitPos, HitTime);
+                    vec4 dummyP = vec4(0.0);
+                    // out_to_in = true 转换为 Ingoing
+                    transformKerrSchild_YSpin(tempX, HitPointSign, dummyP, true);
+                    PatternPos = tempX.xyz;
+                    PatternTime = tempX.w;
+                }
+
+                float Phi_raw = Vec2ToTheta(normalize(PatternPos.zx), vec2(0.0, 1.0));
+                float Phi = Phi_raw + Omega * PatternTime + iBlackHoleTime*GetZamoOmega(TargetSignedR, PhysicalSpinA, PhysicalQ, 1.0);
+                
+                float CosTheta = clamp(PatternPos.y / TargetGeoR, -1.0, 1.0);
+                float Theta = acos(CosTheta);
+                float SinTheta = sqrt(max(0.0, 1.0 - CosTheta * CosTheta));
+
+                float DensityPhi = 24.0;
+                float DensityTheta = 12.0;
+                float DistFactor = length(PatternPos);
+                float LineWidth = 0.001 * DistFactor;
+                LineWidth = clamp(LineWidth, 0.01, 0.1); 
+
+                float PatternPhi = abs(fract(Phi / (2.0 * kPi) * DensityPhi) - 0.5);
+                float GridPhi = smoothstep(LineWidth / max(0.005, SinTheta), 0.0, PatternPhi);
+
+                float PatternTheta = abs(fract(Theta / kPi * DensityTheta) - 0.5);
+                float GridTheta = smoothstep(LineWidth, 0.0, PatternTheta);
+                
+                float GridIntensity = max(GridPhi, GridTheta);
+
+                if (GridIntensity > 0.01) {
+                    float BaseTemp = 6500.0;
+                    vec3 BlackbodyColor = KelvinToRgb(BaseTemp * Shift);
+                    float Intensity = min(1.5 * pow(Shift, 4.0), 20.0);
+                    vec4 GridCol = vec4(BlackbodyColor * Intensity, 1.0);
+                    
+                    float Alpha = GridIntensity * 0.5; 
+                    CurrentResult.rgb += GridCol.rgb * Alpha * (1.0 - CurrentResult.a);
+                    CurrentResult.a   += Alpha * (1.0 - CurrentResult.a);
+                }
+            }
+        }
+    }
+
+    // --- 赤道面的网格处理同样映射为统一相空间 ---
+    if (bHasCrossed && CurrentResult.a < 0.99) {
+        
+        float HitRho = length(DiskHitPos.xz);
+        float a_abs = abs(PhysicalSpinA);
+        float HitTime_disk = mix(LastRayPos.w, RayPos.w, t_cross);
+        
+        vec3 PatternPosDisk = DiskHitPos;
+        if (isoutgoing) {
+            vec4 tempX = vec4(DiskHitPos, HitTime_disk);
+            vec4 dummyP = vec4(0.0);
+            float diskSign = (length(DiskHitPos.xz) < abs(PhysicalSpinA)) ? -StartStepSign : StartStepSign;
+            transformKerrSchild_YSpin(tempX, diskSign, dummyP, true);
+            PatternPosDisk = tempX.xyz;
+        }
+
+        float Phi_raw = Vec2ToTheta(normalize(PatternPosDisk.zx), vec2(0.0, 1.0));
+        float Phi = Phi_raw;
+        
+        float DensityPhi = 24.0;
+        float DistFactor = length(DiskHitPos); 
+        float LineWidth = 0.001 * DistFactor;
+        LineWidth = clamp(LineWidth, 0.01, 0.1);
+
+        float PatternPhi = abs(fract(Phi / (2.0 * kPi) * DensityPhi) - 0.5);
+        float GridPhi = smoothstep(LineWidth / max(0.1, HitRho / a_abs), 0.0, PatternPhi);
+
+        float NormalizedRho = HitRho / max(1e-6, a_abs);
+        float DensityRho = 5.0; 
+        float PatternRho = abs(fract(NormalizedRho * DensityRho) - 0.5);
+        float GridRho = smoothstep(LineWidth, 0.0, PatternRho);
+        
+        float GridIntensity = max(GridPhi, GridRho);
+
+        if (GridIntensity > 0.01) {
+            // (频移由于和空间无关依然使用原始数据)
+            vec4 U_zero = vec4(0.0, 0.0, 0.0, 1.0); 
+            float E_emit = -dot(iP_cov, U_zero); 
+            float Shift = 1.0 / max(1e-6, abs(E_emit));
+            
+            float BaseTemp = 6500.0; 
+            vec3 BlackbodyColor = KelvinToRgb(BaseTemp * Shift);
+            float Intensity = min(2.0 * pow(Shift, 4.0), 30.0);
+            
+            vec4 GridCol = vec4(BlackbodyColor * Intensity, 1.0);
+            
+            float Alpha = GridIntensity * 0.5;
+            CurrentResult.rgb += GridCol.rgb * Alpha * (1.0 - CurrentResult.a);
+            CurrentResult.a   += Alpha * (1.0 - CurrentResult.a);
+        }
+    }
+
+    return CurrentResult;
+}
+
+// =============================================================================
+// 致密星表面（NPGS 逐行移植）：iDensestarsurfaceR != 0 时渲染一颗黑体着色的
+// 椭球"中子星"表面，含频移→温度→黑体色链路。依赖 Fbm_Standalone。
+// =============================================================================
+float Fbm_Standalone(vec3 x) {
+    vec2 sum = vec2(0.0);
+    float ampl = 1.0;
+    for (int i = 0; i < 3; ++i) {
+        sum += ampl * PerlinNoise(x);
+        // 原版的域扭曲(Domain Warping)逻辑，增加流体感
+        x += 1.4 * sum.xyx * vec3(0.7, 0.6, 1.3);
+        ampl *= 0.74;
+        x *= vec3(4.0, 4.0, 4.0);
+    }
+    return sum.x;
+}
+
+vec4 DensestarColor(vec4 BaseColor, vec4 RayPos, vec4 LastRayPos,
+                    vec4 P_cov, vec4 LastP_cov, 
+                    float PhysicalSpinA, float PhysicalQ, bool isoutgoing,
+                    float EndStepSign, float dlambda)
+{
+    vec4 CurrentResult = BaseColor;
+    // 如果不透明度已满，或者未启用致密星渲染，则直接返回
+    if (iDensestarsurfaceR == 0.0) return CurrentResult;
+
+    // 获取起点和终点的几何信息并升指标，求出坐标对仿射参量的导数 dX/dlambda
+    KerrGeometry geo_last;
+    ComputeGeometryScalars(LastRayPos.xyz, 1.0, EndStepSign, isoutgoing, geo_last);
+    vec4 V0 = RaiseIndex(LastP_cov, geo_last); 
+    vec4 T0 = V0 * dlambda; 
+
+    KerrGeometry geo_curr;
+    ComputeGeometryScalars(RayPos.xyz, 1.0, EndStepSign, isoutgoing, geo_curr);
+    vec4 V1 = RaiseIndex(P_cov, geo_curr);     
+    vec4 T1 = V1 * dlambda; 
+
+    float TargetSignedR = iDensestarsurfaceR; 
+    float TargetGeoR = abs(TargetSignedR); 
+    
+    vec3 O = LastRayPos.xyz;
+    vec3 D_vec = RayPos.xyz - LastRayPos.xyz;
+
+    // 椭球面求交
+    vec2 roots = IntersectKerrEllipsoid(O, D_vec, TargetGeoR, PhysicalSpinA);
+    
+    float t_hits[2];
+    t_hits[0] = roots.x;
+    t_hits[1] = roots.y;
+    // 确保按射线前进方向排序
+    if (t_hits[0] > t_hits[1]) {
+        float temp = t_hits[0]; t_hits[0] = t_hits[1]; t_hits[1] = temp;
+    }
+    
+    for (int j = 0; j < 2; j++) {
+        float t = t_hits[j];
+        
+        if (t >= 0.0 && t <= 1.0) {
+            float HitPointSign = EndStepSign;
+            if (HitPointSign * TargetSignedR < 0.0) continue;
+
+            // 曲线与椭球面相交的牛顿迭代修整
+            for(int iter = 0; iter < 2; iter++) {
+                float t2 = t*t; float t3 = t2*t;
+                vec4 H = vec4(2.0*t3 - 3.0*t2 + 1.0, t3 - 2.0*t2 + t, -2.0*t3 + 3.0*t2, t3 - t2);
+                vec3 pos = (H.x*LastRayPos + H.y*T0 + H.z*RayPos + H.w*T1).xyz;
+                float curR = KerrSchildRadius(pos, HitPointSign);
+                
+                float dt = 0.001;
+                float nt = t + dt;
+                float nt2 = nt*nt; float nt3 = nt2*nt;
+                vec4 nH = vec4(2.0*nt3 - 3.0*nt2 + 1.0, nt3 - 2.0*nt2 + nt, -2.0*nt3 + 3.0*nt2, nt3 - nt2);
+                vec3 npos = (nH.x*LastRayPos + nH.y*T0 + nH.z*RayPos + nH.w*T1).xyz;
+                float nextR = KerrSchildRadius(npos, HitPointSign);
+                
+                float dr_dt = (nextR - curR) / dt;
+                t -= (curR - TargetSignedR) / (dr_dt + 1e-12);
+            }
+            
+            if (t < 0.0 || t > 1.0) continue; 
+            
+            // 提取高精度四维坐标与动量
+            float t2 = t*t; float t3 = t2*t;
+            vec4 H = vec4(2.0*t3 - 3.0*t2 + 1.0, t3 - 2.0*t2 + t, -2.0*t3 + 3.0*t2, t3 - t2);
+            vec4 HitX = H.x*LastRayPos + H.y*T0 + H.z*RayPos + H.w*T1;
+            
+            vec3 HitPos = HitX.xyz;
+            float HitTime = HitX.w;
+            
+            float CheckR = KerrSchildRadius(HitPos, HitPointSign);
+            if (abs(CheckR - TargetSignedR) > 0.1 * TargetGeoR + 0.1) continue; 
+
+            vec4 HitP_cov = mix(LastP_cov, P_cov, t);
+
+            // 映射参考系以提取局部坐标
+            vec3 PatternPos = HitPos;
+            float PatternTime = HitTime;
+            if (isoutgoing) {
+                vec4 tempX = vec4(HitPos, HitTime);
+                vec4 dummyP = vec4(0.0);
+                transformKerrSchild_YSpin(tempX, HitPointSign, dummyP, true);
+                PatternPos = tempX.xyz;
+                PatternTime = tempX.w;
+            }
+
+            // --- 【核心修改：刚体角速度与四维速度】 ---
+            float R2 = TargetSignedR * TargetSignedR;
+            float a2 = PhysicalSpinA * PhysicalSpinA;
+            float Omega_star = PhysicalSpinA / (R2 + a2); // 星体指定等角速度刚体旋转
+
+            float EmissionTime = iBlackHoleTime + PatternTime;
+            
+            
+            // 1. 获取归一化的表面坐标
+            vec3 pos_tex = normalize(PatternPos);
+            
+            // 2. 将 3D 坐标随刚体自旋绕 Y 轴旋转
+            float rotAngle = Omega_star * EmissionTime;
+            float c_rot = cos(rotAngle);
+            float s_rot = sin(rotAngle);
+            pos_tex.xz = mat2(c_rot, s_rot, -s_rot, c_rot) * pos_tex.xz;
+            
+            // 3. 应用中子星的纹理缩放倍数
+            pos_tex *= 4.0;
+            
+            // 4. 表面等离子体沸腾/流动动画 (利用 EmissionTime 替代原版的 starTime)
+            // 原版: sin(starTime / 128.0 * 3.14) * 50.0
+            // 这里我们调整一下时间缩放比例，保证视觉流动速度适当
+            float animSpeed = EmissionTime * 0.01; 
+            
+            vec3 noisePos = vec3(
+                pos_tex.x + sin(animSpeed) * 2.0,
+                pos_tex.y + cos(animSpeed) * 2.0, 
+                pos_tex.z
+            );
+            
+            // 5. 采样独立实现的 3D FBM 噪声
+            float noiseVal = Fbm_Standalone(noisePos);
+            
+            // 6. 将噪声映射为温度调制系数 (0.8 ~ 1.0 波动区间，完美复刻 MOD)
+            float tempMod = clamp(noiseVal * 0.2 + 0.8,0.5,1.5);
+            
+            // 7. 映射到发光体的物理静止系温度 (基准温度乘以调制系数)
+            // 你可以把 6000.0 替换为你的恒星基础温度变量（如果外部有传如 iDensestarTemp 等）
+            float BaseTemp_Kelvin = 6000.0 * tempMod; 
+            
+            // =================================================================
+
+            // --- 【核心修改：频移系数 g 计算】 ---
+            // 星体刚体旋转的局部四维速度 U_star
+            vec3 VelSpatial = Omega_star * vec3(HitPos.z, 0.0, -HitPos.x);
+            vec4 U_star_unnorm = vec4(VelSpatial, 1.0); 
+            
+            KerrGeometry geo_hit;
+            ComputeGeometryScalars(HitPos, 1.0, HitPointSign, isoutgoing, geo_hit);
+            vec4 U_star_lower = LowerIndex(U_star_unnorm, geo_hit);
+            float norm_sq = dot(U_star_unnorm, U_star_lower);
+            vec4 U_star = U_star_unnorm / sqrt(max(1e-9, abs(norm_sq)));
+
+            // 发射能量与无穷远观测能量 (P_cov 的 w 分量为 -E_obs 守恒量)
+            float E_emit_raw = -dot(HitP_cov, U_star);
+            float g = 1.0 / max(1e-9, abs(E_emit_raw)); 
+
+
+            // --- 【核心修改：计算频移后的温度与亮度】 ---
+            // 观测温度 = 静止温度 * (g ^ 频移温度指数)
+            float ObsTemp_Kelvin = BaseTemp_Kelvin * pow(g, iDensestarRedShiftColorExponent);
+            
+            // 获取对应色温的黑体颜色
+            vec3 BlackBodyColor = KelvinToRgb(ObsTemp_Kelvin);
+
+            // 观测亮度 = (自身静止温度导致的热辐射亮度基数) * (g ^ 频移亮度指数)
+            float BaseIntensity = pow(BaseTemp_Kelvin / 6000.0, iDensestarBlackbodyIntensityExponent); 
+            float RedshiftIntensity = pow(g, iDensestarRedShiftIntensityExponent);
+            float FinalIntensity = BaseIntensity * RedshiftIntensity;
+            // =================================================================
+            // ↓↓↓ 测试/调试功能：八卦限颜色与经纬网棋盘格 (取消外部块注释即可生效) ↓↓↓
+            if(iDEBUG==5)
+            {
+                // 获取归一化的随动局部坐标（因为上文 pos_tex 被 *= 4.0 放大过，需还原方向）
+                vec3 unit_pos = normalize(pos_tex);
+                
+                // 1. 八卦限颜色：利用 step 判断 x, y, z 的正负号映射到 RGB
+                vec3 octantColor = step(0.0, unit_pos); 
+                // 为了避免纯黑(0,0,0)卦限看不见，将其映射到 0.2 ~ 1.0 范围
+                octantColor = octantColor * 0.8 + 0.2;  
+
+                // 2. 获取球坐标经纬度
+// 2. 获取球坐标经纬度（包含针对 atan(0,0) 和 asin(>1) 的防 NaN 保护）
+            float phi = atan(unit_pos.z, abs(unit_pos.x) < 1e-9 && abs(unit_pos.z) < 1e-9 ? 1e-9 : unit_pos.x); 
+            float theta = asin(clamp(unit_pos.y, -1.0, 1.0));
+                
+                // 3. 计算棋盘格网格 (调节 6.0 这个系数可改变网格密度)
+                float u = phi * 6.0;   
+                float v = theta * 6.0; 
+                float checker = mod(floor(u) + floor(v), 2.0); // 结果为 0.0 或 1.0
+                
+                // 4. 将棋盘格映射为亮度调节系数（例如暗格亮度 0.3，亮格亮度 1.0）
+                float checkerIntensity = clamp(checker * 0.7 + 0.3,0.0,1.0);
+                
+                // 5. 覆写原物理计算结果 (保留了相对论红蓝移造成的 RedshiftIntensity，方便观察引力透镜和多普勒效应)
+                BlackBodyColor = octantColor;
+                FinalIntensity = checkerIntensity * RedshiftIntensity;
+            }
+            
+            // ↑↑↑ 测试/调试功能结束 ↑↑↑
+            // =================================================================
+            vec4 StarCol = vec4(iDensestarBrightmut * BlackBodyColor * FinalIntensity, 1.0);
+            
+            // 处理负能量光线 / 反宇宙反色
+            if (E_emit_raw < 0.0) {
+                float cMax = max(max(StarCol.r, StarCol.g), StarCol.b);
+                float cMin = min(min(StarCol.r, StarCol.g), StarCol.b);
+                StarCol.rgb = vec3(cMax + cMin) - StarCol.rgb;
+                if (iWhitehole == 0) StarCol.rgba = vec4(0.0);
+            }
+            
+            // 将实体完全覆盖上去并退出循环
+            CurrentResult.rgb += StarCol.rgb * StarCol.a * (1.0 - CurrentResult.a);
+            CurrentResult.a   += StarCol.a * (1.0 - CurrentResult.a);
+            
+            if(CurrentResult.a > 0.99) break; 
+        }
+    }
+
+    return CurrentResult;
+}
+
+// =============================================================================
+// 沿零矢量内落的白色光点（NPGS 逐行移植，调试用）：几何体沿 Ingoing 主零矢量
+// 下落，用于直观察看光线的传播与坐标系切换。依赖 GetIngoingNullParticlePos
+// 与 GetDotDistSq（Hermite 插值求最近距离）。
+// =============================================================================
+// 辅助函数 1：获取在 Ingoing 坐标下，沿零矢量内落的粒子空间坐标
+// M = 0.5 (rs = 1.0)，Y轴为自旋轴，沿赤道面内落
+// =====================================================================
+vec3 GetIngoingNullParticlePos(float time, float a) {
+    // 设定周期，让光点不断生成并下落，方便持续观察
+    float period = 15.0; 
+    float t = mod(time, period);
+    
+    // 初始半径 r0 设为 10.0 rs。沿 Ingoing 主要零矢量下落，满足 dr/dt = -1
+    float r0 = 10.0;
+    float r = r0 - t; 
+    
+    // 固定坐标角 (赤道面 theta = pi/2, phi = 0)
+    float theta = 1.57079632679; 
+    float phi = 0.0; 
+    
+    float sinTh = sin(theta);
+    float cosTh = cos(theta);
+    float sinPh = sin(phi);
+    float cosPh = cos(phi);
+    
+    // Kerr-Schild 笛卡尔坐标系映射 (Y-Spin)
+    vec3 pos;
+    pos.x = (r * cosPh + a * sinPh) * sinTh;
+    pos.y = r * cosTh;
+    pos.z = (r * sinPh - a * cosPh) * sinTh;
+    
+    return pos;
+}
+
+// =====================================================================
+// 辅助函数 2：对光线参数 tau 进行插值、换系，并返回与光点的距离平方
+// =====================================================================
+float GetDotDistSq(float tau, vec4 LastRayPos, vec4 RayPos, vec4 T0, vec4 T1, 
+                   float signR, float a, float Q, bool isoutgoing, out vec4 exactX_in) 
+{
+    // 1. 在入参所在系（原生系）进行 Hermite 插值
+    float t2 = tau * tau; 
+    float t3 = t2 * tau;
+    vec4 H = vec4(2.0*t3 - 3.0*t2 + 1.0, t3 - 2.0*t2 + tau, -2.0*t3 + 3.0*t2, t3 - t2);
+    vec4 X_nat = H.x * LastRayPos + H.y * T0 + H.z * RayPos + H.w * T1;
+    
+    exactX_in = X_nat;
+    
+    // 2. 坐标系转换：如果当前是 Outgoing 系，则转换为 Ingoing 系
+    // 参考你原代码的写法，传入 true 执行转换
+    if (isoutgoing) {
+        vec4 dummyP = vec4(0.0);
+        transformKerrSchild_YSpin(exactX_in, signR, dummyP, true);
+    }
+    
+    // 3. 提取 Ingoing 系的全局时间
+    float exactTime = iBlackHoleTime + exactX_in.w;
+    
+    // 4. 获取对应的光点物理位置
+    vec3 dotP = GetIngoingNullParticlePos(exactTime, a);
+    
+    // 5. 返回欧氏距离平方
+    vec3 diff = exactX_in.xyz - dotP;
+    return dot(diff, diff);
+}
+
+vec4 DrawFallingWhiteDot(vec4 BaseColor, vec4 RayPos, vec4 LastRayPos,
+                         vec4 P_cov, vec4 LastP_cov, 
+                         float PhysicalSpinA, float PhysicalQ, bool isoutgoing,
+                         float EndStepSign, float dlambda)
+{
+    vec4 CurrentResult = BaseColor;
+    if (CurrentResult.a > 0.99) return CurrentResult;
+
+    // 1. 获取起点和终点的几何信息并升指标，求出 dX/dlambda
+    KerrGeometry geo_last;
+    ComputeGeometryScalars(LastRayPos.xyz, 1.0, EndStepSign, isoutgoing, geo_last);
+    vec4 V0 = RaiseIndex(LastP_cov, geo_last); 
+    vec4 T0 = V0 * dlambda; 
+
+    KerrGeometry geo_curr;
+    ComputeGeometryScalars(RayPos.xyz, 1.0, EndStepSign, isoutgoing, geo_curr);
+    vec4 V1 = RaiseIndex(P_cov, geo_curr);     
+    vec4 T1 = V1 * dlambda; 
+    
+    // 2. 为了防止大步长直接穿透 0.02 rs 的球体，取 tau = 0.0, 0.5, 1.0 采样
+    vec4 dummyX;
+    float d0  = GetDotDistSq(0.0, LastRayPos, RayPos, T0, T1, EndStepSign, PhysicalSpinA, PhysicalQ, isoutgoing, dummyX);
+    float d05 = GetDotDistSq(0.5, LastRayPos, RayPos, T0, T1, EndStepSign, PhysicalSpinA, PhysicalQ, isoutgoing, dummyX);
+    float d1  = GetDotDistSq(1.0, LastRayPos, RayPos, T0, T1, EndStepSign, PhysicalSpinA, PhysicalQ, isoutgoing, dummyX);
+    
+    // 3. 抛物线拟合 P(tau) = A*tau^2 + B*tau + C，寻找最近点参数 tau_min
+    float A = 2.0 * d1 + 2.0 * d0 - 4.0 * d05;
+    float B = 4.0 * d05 - d1 - 3.0 * d0;
+    
+    float tau_min = 0.5;
+    if (abs(A) > 1e-9) {
+        tau_min = clamp(-B / (2.0 * A), 0.0, 1.0);
+    } else {
+        tau_min = (d0 < d1) ? 0.0 : 1.0;
+    }
+    
+    // 4. 精确计算最近点处的距离
+    float distSq_min = GetDotDistSq(tau_min, LastRayPos, RayPos, T0, T1, EndStepSign, PhysicalSpinA, PhysicalQ, isoutgoing, dummyX);
+    
+    // 保险机制：防止拟合在极端扭曲下失效，确保拿到的确实是最小值
+    float min_d = distSq_min;
+    if(d0  < min_d) min_d = d0;
+    if(d1  < min_d) min_d = d1;
+    if(d05 < min_d) min_d = d05;
+    
+    float exactDist = sqrt(max(0.0, min_d));
+    
+    // 设定目标范围为 0.02 rs
+    float threshold = 0.1;
+
+    // 5. 如果光线确实掠过了该范围，则进行染色
+    if (exactDist < threshold) {
+        // 计算这一步跨越的空间真实长度
+        float stepLength = length(RayPos.xyz - LastRayPos.xyz);
+        
+        // 计算光线在目标球体内截取的弦长
+        float chordLength = 2.0 * sqrt(max(0.0, threshold * threshold - exactDist * exactDist));
+        
+        // 取步长与弦长的较小值，保证渲染不依赖于光追步长的大小 (防闪烁/过爆核心机制)
+        float effectiveLength = min(stepLength, chordLength);
+        
+        // 外部柔和光晕
+        float intensity = smoothstep(threshold, 0.0, exactDist);
+        // 内部高亮核心
+        float core = exp(-(exactDist * exactDist) / (0.005 * 0.005));
+        
+        // 亮度乘子，根据视觉反馈微调
+        float density = intensity * 200.0 + core * 800.0;
+        
+        // 根据穿过的有效长度计算不透明度贡献
+        float dotAlpha = clamp(density * effectiveLength, 0.0, 1.0);
+        
+        // 叠加白光
+        vec3 whiteColor = vec3(1.0, 1.0, 1.0);
+        CurrentResult.rgb += whiteColor * dotAlpha * (1.0 - CurrentResult.a);
+        CurrentResult.a   += dotAlpha * (1.0 - CurrentResult.a);
+    }
+
+    return CurrentResult;
+}
+
+// =============================================================================
+// 贴图盘（NPGS 逐行移植）：iUseImageDisk != 0 时在赤道面上铺一张贴图（Disk/R.jpg，
+// 绑 set1.b9 = iImageTexture），随 iImageRotationSpeed 自转。用于把真实吸积盘影像
+// 投到赤道面做对照。自包含实现，无外部辅助依赖。
+// =============================================================================
+vec4 ImageDiskColor(vec4 BaseColor, vec4 RayPos, vec4 LastRayPos,
+                    vec4 P_cov, vec4 LastP_cov, 
+                    float PhysicalSpinA, float PhysicalQ, bool isoutgoing,
+                    float EndStepSign, float dlambda,
+                    float InterRadius, float OuterRadius,
+                    float RedShiftColorExponent, float RedShiftIntensityExponent)
+{
+    vec4 CurrentResult = BaseColor;
+    // 如果不透明度已满，直接返回
+    if (CurrentResult.a > 0.99) return CurrentResult;
+
+    // 仅当光线穿过赤道面 (y=0) 时触发运算
+    if (LastRayPos.y * RayPos.y >= 0.0) return CurrentResult;
+
+    float StartStepSign = EndStepSign;
+    float t_cross = -1.0;
+    vec4 DiskHitX = vec4(0.0);
+    vec3 DiskHitPos = vec3(0.0);
+
+    // 获取起点和终点的几何信息并升指标，求出坐标对仿射参量的导数 dX/dlambda
+    KerrGeometry geo_last;
+    ComputeGeometryScalars(LastRayPos.xyz, 1.0, StartStepSign, isoutgoing, geo_last);
+    vec4 V0 = RaiseIndex(LastP_cov, geo_last); 
+    vec4 T0 = V0 * dlambda; 
+
+    KerrGeometry geo_curr;
+    ComputeGeometryScalars(RayPos.xyz, 1.0, EndStepSign, isoutgoing, geo_curr);
+    vec4 V1 = RaiseIndex(P_cov, geo_curr);     
+    vec4 T1 = V1 * dlambda; 
+
+    // --- 赤道盘相交：三次 Hermite 曲线求根 ---
+    float denom = (LastRayPos.y - RayPos.y);
+    if(abs(denom) > 1e-9) {
+        t_cross = LastRayPos.y / denom; // 线性初猜
+        
+        // 牛顿迭代求精确零点
+        for(int iter = 0; iter < 3; iter++) {
+            float t2 = t_cross * t_cross;
+            float t3 = t2 * t_cross;
+            
+            float h00 = 2.0*t3 - 3.0*t2 + 1.0;
+            float h10 = t3 - 2.0*t2 + t_cross;
+            float h01 = -2.0*t3 + 3.0*t2;
+            float h11 = t3 - t2;
+            float yt = h00*LastRayPos.y + h10*T0.y + h01*RayPos.y + h11*T1.y;
+            
+            float dh00 = 6.0*t2 - 6.0*t_cross;
+            float dh10 = 3.0*t2 - 4.0*t_cross + 1.0;
+            float dh01 = -6.0*t2 + 6.0*t_cross;
+            float dh11 = 3.0*t2 - 2.0*t_cross;
+            float dyt = dh00*LastRayPos.y + dh10*T0.y + dh01*RayPos.y + dh11*T1.y;
+            
+            t_cross -= yt / (dyt + 1e-12);
+        }
+        t_cross = clamp(t_cross, 0.0, 1.0);
+        
+        // 依据精确 t 计算交点四维坐标
+        float t2 = t_cross * t_cross;
+        float t3 = t2 * t_cross;
+        vec4 H = vec4(2.0*t3 - 3.0*t2 + 1.0, t3 - 2.0*t2 + t_cross, -2.0*t3 + 3.0*t2, t3 - t2);
+        DiskHitX = H.x*LastRayPos + H.y*T0 + H.z*RayPos + H.w*T1;
+        DiskHitPos = DiskHitX.xyz;
+        
+        if (length(DiskHitPos.xz) < abs(PhysicalSpinA)) {
+            StartStepSign = -EndStepSign;
+        }
+    } else {
+        return CurrentResult;
+    }
+
+    // --- 将坐标映射回统一的 Ingoing 参考系 ---
+       // --- 将坐标映射回统一的 Ingoing 参考系 ---
+    float HitTime_disk = DiskHitX.w;
+    vec3 PatternPosDisk = DiskHitPos;
+    if (isoutgoing) {
+        vec4 tempX = vec4(DiskHitPos, HitTime_disk);
+        vec4 dummyP = vec4(0.0);
+        float diskSign = (length(DiskHitPos.xz) < abs(PhysicalSpinA)) ? -StartStepSign : StartStepSign;
+        transformKerrSchild_YSpin(tempX, diskSign, dummyP, true);
+        PatternPosDisk = tempX.xyz;
+        HitTime_disk = tempX.w; // 顺手补上时间的更新，保证光线时间滞后计算精确
+    }
+
+    // --- 几何与纹理映射逻辑 ---
+    float r_xz = length(PatternPosDisk.xz);
+    // 挖去内部孔洞
+    if (r_xz < InterRadius) return CurrentResult;
+
+    // 【新增：计算旋转角并对坐标进行矩阵旋转】
+    float EmissionTime = iBlackHoleTime + HitTime_disk; // 提取光线命中该位置时的物理世界时间
+    float rotAngle = iImageRotationSpeed * EmissionTime; // <- 注意：请确保名字与你传入的 uniform 变量名一致
+    float cosA = cos(rotAngle);
+    float sinA = sin(rotAngle);
+    
+    // 对坐标进行反向矩阵旋转（等效于图片本身正向旋转）
+    vec2 RotatedXZ = mat2(cosA, sinA, -sinA, cosA) * PatternPosDisk.xz;
+
+    // 根据对角线为 OuterRadius 计算正方形边长
+    // 对角线 D = OuterRadius，正方形边长 S = D / sqrt(2)
+    float ImageWidth = OuterRadius * 0.70710678; 
+    float HalfWidth = ImageWidth * 0.5;
+
+    // 剔除正方形边界之外的区域 (改用旋转后的 RotatedXZ)
+    if (abs(RotatedXZ.x) > HalfWidth || abs(RotatedXZ.y) > HalfWidth) return CurrentResult;
+
+    // 映射到 [0, 1] 的 UV 坐标 (改用旋转后的 RotatedXZ)
+    float U = (RotatedXZ.x + HalfWidth) / ImageWidth;
+    float V = (RotatedXZ.y + HalfWidth) / ImageWidth;
+
+    // 使用 textureLod 避免由于控制流分支导致计算 mipmap 梯度报错
+    vec4 TexColor = textureLod(iImageTexture, vec2(U, V), 0.0);
+    TexColor.xyz*=iBrightmut; 
+    TexColor.a*=iDarkmut;   
+    if (TexColor.a < 0.01) return CurrentResult; // 纯透明部分跳过
+
+    // --- 提取四维动量用于频移计算 ---
+    vec4 HitP_cov = mix(LastP_cov, P_cov, t_cross);
+
+    // 计算静止物体 (U_spatial = 0) 局部能量 E_emit
+    // 计算带有圆轨道速度（开普勒运动）的局部能量 E_emit
+    KerrGeometry geo_hit;
+    float hitSign = (length(DiskHitPos.xz) < abs(PhysicalSpinA)) ? -StartStepSign : StartStepSign;
+    ComputeGeometryScalars(DiskHitPos, 1.0, hitSign, isoutgoing, geo_hit);
+
+    // 获取当前交点的等效半径，并算出对应的开普勒角速度（内部有限制防止在半径极小处崩溃）
+    float PosR = KerrSchildRadius(DiskHitPos, hitSign);
+    float AngularVelocity = GetKeplerianAngularVelocity(max(InterRadius, PosR), 1.0);
+    
+    // 构造带圆轨道旋转的未归一化四维速度，自旋方向为Y轴 (v_x = -Omega * z, v_z = Omega * x)
+    vec4 U_unnorm = vec4(AngularVelocity * DiskHitPos.z, 0.0, -AngularVelocity * DiskHitPos.x, 1.0);
+
+    vec4 U_lower = LowerIndex(U_unnorm, geo_hit);
+    float norm_sq = dot(U_unnorm, U_lower);
+    float norm = sqrt(max(1e-9, abs(norm_sq))); // 取绝对值并加上容差避免极端超光速情况下的崩溃
+    vec4 U_orbit = U_unnorm / norm;
+
+    // 发射能量 = - P_mu * U^mu
+    float E_emit = -dot(HitP_cov, U_orbit); 
+    float Shift = 1.0 / max(1e-6, abs(E_emit));
+
+    // --- 非黑体天空盒风格频移逻辑 ---
+    float EffectiveColorShift = pow(Shift, RedShiftColorExponent);
+
+    vec3 Rcolor = TexColor.r * 1.0 * WavelengthToRgb(max(453.0, 645.0 / EffectiveColorShift));
+    vec3 Gcolor = TexColor.g * 1.5 * WavelengthToRgb(max(416.0, 510.0 / EffectiveColorShift));
+    vec3 Bcolor = TexColor.b * 0.6 * WavelengthToRgb(max(380.0, 440.0 / EffectiveColorShift));
+    vec3 Scolor = Rcolor + Gcolor + Bcolor;
+
+    float OStrength = 0.3 * TexColor.r + 0.6 * TexColor.g + 0.1 * TexColor.b;
+    float RStrength = 0.3 * Scolor.r + 0.6 * Scolor.g + 0.1 * Scolor.b;
+    Scolor *= OStrength / max(RStrength, 0.001);
+
+    // 亮度频移乘数
+    Scolor *= pow(Shift, RedShiftIntensityExponent);
+
+    if (E_emit < 0.0) {
+        float cMax = max(max(Scolor.r, Scolor.g), Scolor.b);
+        float cMin = min(min(Scolor.r, Scolor.g), Scolor.b);
+        Scolor.rgb = vec3(cMax + cMin) - Scolor.rgb;
+        if (iWhitehole == 0) {
+            Scolor.rgb = vec3(0.0);
+            TexColor.a = 0.0;
+        }
+    }
+
+    // 混合到当前累计颜色
+    CurrentResult.rgb += Scolor * TexColor.a * (1.0 - CurrentResult.a);
+    CurrentResult.a   += TexColor.a * (1.0 - CurrentResult.a);
+
+    return CurrentResult;
+}
+
+// =============================================================================
+// 调试视图 2：初始动量可视化（NPGS 逐行移植）。把 TraceRay 入口处的光子四动量
+// 与观者标架关系画成颜色，用于排查 GetInitialMomentum 的系/符号/正交化是否正确。
+// 仅 iDEBUG==2 时由 TraceRay 调用并直接返回。
+// =============================================================================
+vec3 DebugInitialMomentum(
+    vec4 P_cov, 
+    vec4 X, 
+    int ObserverMode, 
+    float universesign, 
+    float PhysicalSpinA, 
+    float PhysicalQ, 
+    float GravityFade, 
+    bool isOutgoing, 
+    vec3 CameraVelocity
+) {
+    if (P_cov == vec4(114514.0)) return vec3(0.0);
+
+    KerrGeometry geo;
+    ComputeGeometryScalars(X.xyz, GravityFade, universesign, isOutgoing, geo);
+
+    // 升指标得到逆变动量，计算模长平方（测试类光条件）
+    vec4 P_up = RaiseIndex(P_cov, geo);
+    float norm_sq = dot(P_cov, P_up);
+
+    // ====================================
+    // 重建观者四维速度和局部平直标架
+    // ====================================
+    vec4 U_up;
+    float g_tt = -1.0 + geo.f;
+    float time_comp = 1.0 / sqrt(max(1e-9, -g_tt));
+    U_up = vec4(0.0, 0.0, 0.0, time_comp);
+    
+    if (ObserverMode == 1) {
+        float r = geo.r; float r2 = geo.r2; float a = PhysicalSpinA; float a2 = geo.a2;
+        float y_phys = X.y; 
+        float rho2 = r2 + a2 * (y_phys * y_phys) / (r2 + 1e-9);
+        float Q2 = PhysicalQ * PhysicalQ;
+        float MassChargeTerm = 2.0 * CONST_M * r - Q2;
+        float Xi = sqrt(max(0.0, MassChargeTerm * (r2 + a2)));
+        float DenomPhi = rho2 * (MassChargeTerm + Xi);
+        float U_phi_KS = (abs(DenomPhi) > 1e-9) ? (-MassChargeTerm * a / DenomPhi) : 0.0;
+        float U_r_KS = -Xi / max(1e-9, rho2);
+        float inv_r2_a2 = 1.0 / (r2 + a2);
+        float Ux_rad = (r * X.x - a * X.z) * inv_r2_a2 * U_r_KS;
+        float Uz_rad = (r * X.z + a * X.x) * inv_r2_a2 * U_r_KS;
+        float Uy_rad = (X.y / r) * U_r_KS;
+        float Ux_tan =  X.z * U_phi_KS;
+        float Uz_tan = -X.x * U_phi_KS;
+        
+        vec3 U_spatial = vec3(Ux_rad + Ux_tan, Uy_rad, Uz_rad + Uz_tan);
+        float l_dot_u_spatial = dot(geo.l_down.xyz, U_spatial);
+        float U_spatial_sq = dot(U_spatial, U_spatial);
+        float A = -1.0 + geo.f;
+        float B = 2.0 * geo.f * l_dot_u_spatial;
+        float C = U_spatial_sq + geo.f * (l_dot_u_spatial * l_dot_u_spatial) + 1.0; 
+        float Det = max(0.0, B*B - 4.0 * A * C);
+        float Ut = (abs(A) < 1e-7) ? (-C / max(1e-19, B)) : ((B < 0.0) ? (2.0 * C / (-B + sqrt(Det))) : ((-B - sqrt(Det)) / (2.0 * A)));
+        
+        U_up = mix(vec4(0.0, 0.0, 0.0, time_comp), vec4(U_spatial, Ut), GravityFade);
+    } else if (ObserverMode == 2) {
+        vec3 v_in = CameraVelocity;
+        if (any(isnan(v_in)) || any(isinf(v_in))) v_in = vec3(0.0);
+        vec4 V_up = vec4(v_in, 1.0);
+        vec4 V_down = LowerIndex(V_up, geo);
+        float V_sq = dot(V_up, V_down);
+        if (V_sq < 0.0) U_up = V_up * inversesqrt(-V_sq);
+    }
+    vec4 U_down = LowerIndex(U_up, geo);
+
+    vec3 m_r = -normalize(X.xyz);
+    vec3 WorldUp = vec3(0.0, 1.0, 0.0);
+    if (abs(dot(m_r, WorldUp)) > 0.999) WorldUp = vec3(1.0, 0.0, 0.0);
+    vec3 m_phi = normalize(cross(WorldUp, m_r)); 
+    vec3 m_theta = cross(m_phi, m_r); 
+
+    vec4 e1 = vec4(m_r, 0.0); e1 += dot(e1, U_down) * U_up; vec4 e1_d = LowerIndex(e1, geo); float n1 = sqrt(max(1e-9, dot(e1, e1_d))); e1 /= n1; e1_d /= n1;
+    vec4 e2 = vec4(m_theta, 0.0); e2 += dot(e2, U_down) * U_up; e2 -= dot(e2, e1_d) * e1; vec4 e2_d = LowerIndex(e2, geo); float n2 = sqrt(max(1e-9, dot(e2, e2_d))); e2 /= n2; e2_d /= n2;
+    vec4 e3 = vec4(m_phi, 0.0); e3 += dot(e3, U_down) * U_up; e3 -= dot(e3, e1_d) * e1; e3 -= dot(e3, e2_d) * e2; vec4 e3_d = LowerIndex(e3, geo); e3 /= sqrt(max(1e-9, dot(e3, e3_d)));
+
+    // ====================================
+    // 合法性检查与局部方向投影
+    // ====================================
+    // 计算光在观者局部正交标架下的空间动量: P_local^i = P_mu e_i^mu
+    vec3 p_local = vec3(dot(P_cov, e1), dot(P_cov, e2), dot(P_cov, e3));
+    vec3 local_dir = normalize(p_local); 
+
+    // r通道：检查所有约束条件是否满足
+    bool is_lightlike = abs(norm_sq) < 1e-4;    // 约束1：必须严格类光
+    float E_loc = -dot(P_cov, U_up);
+    bool is_energy_pos = true;//E_loc > 0.0;           // 约束2：观者测量的局部能量必须为正
+    bool is_forward = true;//P_up.w > 0.0;             // 约束3：坐标时间分量一般向未来流动
+
+    float valid_r = (is_lightlike && is_energy_pos && is_forward) ? 1.0 : 0.0;
+
+    // g,b通道：将局部光线的x、y方向投影到 [0, 1] 颜色区间
+    float g_chan = local_dir.x * 0.5 + 0.5;
+    float b_chan = local_dir.y * 0.5 + 0.5;
+
+    return vec3(valid_r, g_chan, b_chan);
+}
+
+// =============================================================================
+// SECTION: 阴影剔除辅助函数（NPGS 逐行移植）
+// 原为 Phase 1.5 的 return 0.0 空壳（当时 iEnableShadowCulling 恒 0、分支不可达）。
+// 该开关已在本项目接通到 KerrParams.shadowCulling，空壳会让阴影几何退化（比较量恒 0），
+// 故在此恢复 NPGS 原版实现：光子球/临界碰撞参数 → 静态观者角 → 落体观者光行差。
+// =============================================================================
+float SolveCubicMaxReal(float P, float K) {
+    if (P >= 0.0) return 0.0; // 理论上黑洞情形 P 均为负
+    float sqrt_term = sqrt(-P / 3.0);
+    // 限制 acos 输入在 [-1, 1] 防止 NaN
+    float val = (3.0 * K) / (2.0 * P) * sqrt(-3.0 / P);
+    float acos_term = acos(clamp(val, -1.0, 1.0));
+    return 2.0 * sqrt_term * cos(acos_term / 3.0);
+}
+
+float SolveQuarticU(float M, float Q, float a, float sign_term, bool is_max_root) {
+    float M2 = M * M;
+    float Q2 = Q * Q;
+
+    // 系数
+    float c2 = 2.0 * Q2 - 3.0 * M2;
+    float c1 = sign_term * (-2.0 * a * M2);
+    float c0 = Q2 * Q2 - M2 * Q2;
+
+    // 初始猜测：
+    // 顺行(A, 小根)，u 较小 (r 接近 M 或 2M)
+    // 逆行(B, 大根)，u 较大 (r 接近 3M 或 4M)
+    float u = is_max_root ? 2.2 * M : 0.8 * M;
+
+    // 牛顿迭代求解
+    for (int i = 0; i < 8; i++) {
+        float u2 = u * u;
+        float u3 = u2 * u;
+
+        float f  = u2 * u2 + c2 * u2 + c1 * u + c0;
+        float df = 4.0 * u3 + 2.0 * c2 * u + c1;
+
+        if (abs(df) < 1e-6) break;
+        u = u - f / df;
+    }
+    return abs(u);
+}
+
+float GetDropFrameAngle(float SinThetaStat, float CosThetaStat, float r, float M, float Q, float a, int ObserverMode) {
+    // 静态观者 (ObserverMode == 0)
+    if (ObserverMode == 0) {
+        return atan(SinThetaStat, CosThetaStat);
+    }
+
+    // 落体观者 (ObserverMode == 1)
+    float a2 = a * a;
+    float r2 = r * r;
+    float MassChargeTerm = 2.0 * M * r - Q * Q;
+
+    float numerator_v = MassChargeTerm * (r2 + a2);
+    float denominator_v = r2 * (r2 + a2) + a2 * MassChargeTerm;
+
+    float v_sq = numerator_v / max(1e-9, denominator_v);
+    v_sq = (1.0 + 0.05 * a) * min(0.9999, max(0.0, v_sq)); // 略微加速、增强收缩，作为冗余
+    float v = sqrt(v_sq);
+
+    // 应用相对论光行差
+    // sin(θ') = sin(θ) * sqrt(1-v^2) / (1 + v*cos(θ))
+    // cos(θ') = (cos(θ) + v) / (1 + v*cos(θ))
+    float denom = 1.0 + v * CosThetaStat;
+    float sin_fall = SinThetaStat * sqrt(max(0.0, 1.0 - v_sq));
+    float cos_fall = CosThetaStat + v;
+
+    return atan(sin_fall, cos_fall);
+}
+
+float GetShadowHalfAngleRN(float r, float M, float Q, int ObserverMode)
+{
+    float M2 = M * M;
+    float Q2 = Q * Q;
+    float r2 = r * r;
+
+    // 光子球半径 r_ps
+    float term_root = sqrt(max(0.0, 9.0 * M2 - 8.0 * Q2));
+    float r_ps = 0.5 * (3.0 * M + term_root);
+
+    // 临界碰撞参数 b_c
+    float metric_factor_ps = 1.0 - 2.0 * M / r_ps + Q2 / (r_ps * r_ps);
+    float b_c = r_ps / sqrt(max(1e-6, metric_factor_ps));
+
+    // 计算静态观者的 Sin 和 Cos
+    // f(r) = 1 - 2M/r + Q^2/r^2
+    float f_r = 1.0 - 2.0 * M / r + Q2 / r2;
+    float sqrt_f = sqrt(max(0.0, f_r));
+
+    // Sin = (b_c / r) * sqrt(f)
+    float sin_theta_stat = (b_c / r) * sqrt_f;
+
+    // 判断光子球内外来决定 Cos 的符号
+    // r < r_ps 时，阴影遮挡超过半个天空，为钝角 (Cos < 0)
+    // 增加一个微小的 epsilon 防止 r == r_ps 时闪烁
+    float cos_sign = (r >= r_ps - 1e-4) ? 1.0 : -1.0;
+
+    // 计算 Cos
+    float cos_theta_stat = cos_sign * sqrt(max(0.0, 1.0 - sin_theta_stat * sin_theta_stat));
+
+    // 换坐标系
+    return GetDropFrameAngle(sin_theta_stat, cos_theta_stat, r, M, Q, 0.0, ObserverMode);
+}
 
 // =============================================================================
 // SECTION7: KN阴影计算
@@ -2563,15 +4091,22 @@ TraceResult TraceRay(vec2 FragUv)
     if (iObserverMode == -1) {
         isoutgoing = (iCamDataCoordisOutgoing == 1);
     }
+
+    // 偏振基底：相机屏幕 right/up 轴的 Walker-Penrose 常数 + 逐样本累积的 Stokes Q/U。
+    // 必须在 GetInitialMomentum 之前声明——前者通过 out 参数写入 WP_CamX/WP_CamY。
+    vec2 WP_CamX = vec2(0.0);
+    vec2 WP_CamY = vec2(0.0);
+    vec2 StokesQU = vec2(0.0);
+
     if (bShouldContinueMarchRay) {
-       P_cov = GetInitialMomentum(RayDir, X, GravityFade, isoutgoing);
+       P_cov = GetInitialMomentum(RayDir, X, GravityFade, isoutgoing, WP_CamX, WP_CamY);
        
        // 如果被拦截（观者在该系下变成类空），且允许最大延拓，说明这是向外运动(如出白洞)的观者，
        // 需换到 Outgoing 系重算初始动量
        // 注意，此处有未定位的bug，导致角度变化
        if (P_cov == vec4(114514.0) && iWhitehole == 1) {
             isoutgoing = true;
-            P_cov = GetInitialMomentum(RayDir, X, GravityFade, isoutgoing);
+            P_cov = GetInitialMomentum(RayDir, X, GravityFade, isoutgoing, WP_CamX, WP_CamY);
         }
      }
     if (P_cov == vec4(114514.0))
@@ -2585,16 +4120,22 @@ TraceResult TraceRay(vec2 FragUv)
 
 
     // -------------------------------------------------------------------------
-    // 初始化偏振基底 (严格绑定到相机真实的屏幕轴)
+    // 偏振基底（WP_CamX / WP_CamY / StokesQU）已在 GetInitialMomentum 调用之前声明并初始化：
+    // 前两者由 GetInitialMomentum 通过 out 参数写入，StokesQU 由 DiskColor/JetColor 累积。
     // -------------------------------------------------------------------------
-// =========================================================================
-    // 初始化偏振基底 (绑定相机屏幕，并执行严格的四维广相正交化与洛伦兹变换)
-    // =========================================================================
-    vec2 WP_CamX = vec2(0.0);
-    vec2 WP_CamY = vec2(0.0);
-    vec2 StokesQU = vec2(0.0);
 
-
+    // 调试视图 2：接管输出，把初始动量/观者标架的构造结果画成颜色后直接返回
+    // （NPGS 同款位置：紧跟初始动量构造，早于一切盘/网格累加）
+    if (iDEBUG == 2 && bShouldContinueMarchRay)
+    {
+        vec3 dbgColor = DebugInitialMomentum(
+            P_cov, X, iObserverMode, iUniverseSign,
+            PhysicalSpinA, PhysicalQ, GravityFade, isoutgoing, iCameraVelocity.xyz
+        );
+        res.AccumColor = vec4(dbgColor, 1.0);
+        res.Status = 3.0; // 标记为不透明，直接绘制到屏幕
+        return res;
+    }
 
     E_conserved = -P_cov.w;
     // -------------------------------------------------------------------------
@@ -2661,7 +4202,10 @@ TraceResult TraceRay(vec2 FragUv)
     bool bEscapeOutHorizon = false;
     bool bEscapeInHorizon = false;
     int universeoffset=0;
-    if(iWhitehole == 1 && !bIsNakedSingularity && CameraStartR <InnerHorizonR) universeoffset++;
+    // 注意：KerrSchildRadius 返回**带符号**半径（反宇宙侧 r_sign=-1 → 负值），
+    // 故此处必须按半径**大小**比较；否则反宇宙下 `负 < InnerHorizonR` 恒成立，
+    // universeoffset 会被误加，Status 抬到 ≥5 而被 main 的 `Status<2.5` 挡掉 → 整屏全黑。
+    if(iWhitehole == 1 && !bIsNakedSingularity && abs(CameraStartR) < InnerHorizonR) universeoffset++;
     float LastDr = 0.0;           
     int RadialTurningCounts = 0;  
     float RayMarchPhase = RandomStep(FragUv, iTime); 
@@ -2754,7 +4298,7 @@ TraceResult TraceRay(vec2 FragUv)
         if(geo.r < InnerHorizonR && lastR > InnerHorizonR) bEscapeInHorizon = true;    //检测穿进(追踪方向)内视界   
         if(geo.r < EventHorizonR && lastR > EventHorizonR) bEscapeOutHorizon = true;   //检测穿进(追踪方向)外视界   
 
-        if(iWhitehole == 1 && !bIsNakedSingularity && geo.r < InnerHorizonR && lastR > InnerHorizonR) universeoffset++;    
+        if(iWhitehole == 1 && !bIsNakedSingularity && abs(geo.r) < InnerHorizonR && abs(lastR) > InnerHorizonR) universeoffset++;    
 
         int allow_uni=3;
         if(1==1) allow_uni=1;
@@ -2871,11 +4415,9 @@ TraceResult TraceRay(vec2 FragUv)
 
         lastR = geo.r;
         
-        if (LastX.y * X.y < 0.0) { 
-            float t_cross = LastX.y / (LastX.y - X.y);
-            float rho_cross = length(mix(LastX.xz, X.xz, t_cross));
-            if (rho_cross < abs(PhysicalSpinA)) CurrentUniverseSign *= -1.0;
-        }
+        // 赤道穿越检测 + 宇宙符号翻转：改用 Phase 1.5 提取的共享函数（原先此处内联展开，
+        // 与 CheckEquatorialCrossing、GetIntermediateSign 三处逻辑重复；现只留这一份调用）
+        CurrentUniverseSign = CheckEquatorialCrossing(LastX, X, CurrentUniverseSign);
         ComputeGeometryScalars(X.xyz, GravityFade, CurrentUniverseSign, isoutgoing, geo);
         bool ShowInnerGrid=true;
         if (iWhitehole == 0 && !bIsNakedSingularity && //类似于视界判定情况1，直接进入视界判定区，这个在有网格也生效.这个判定和上面的直接进入判定以及更下面的不可逃逸剔除有重叠，但这个必须在最前面（），为了InnerGrid不漏光，因为ks系步长可以一次从外视界外进到内视界内，导致在外面看到内视界
@@ -2910,8 +4452,56 @@ TraceResult TraceRay(vec2 FragUv)
             {
                 Result = JetColor(Result, X, LastX, P_cov, LastP_cov, E_conserved,
                               isoutgoing,
-                              RayMarchPhase);
+                              RayMarchPhase, WP_CamX, WP_CamY, StokesQU);
             }
+            // --- 贴图盘（NPGS 逐行移植）：iUseImageDisk != 0 时在赤道面铺 Disk/R.jpg。
+            //     与 NPGS 一致地放在"宇宙选层"门控内、且先于致密星/网格 ---
+            if (iUseImageDisk != 0) {
+                Result = ImageDiskColor(Result, X, LastX, P_cov, LastP_cov,
+                            PhysicalSpinA, PhysicalQ, isoutgoing,
+                            CurrentUniverseSign, -dLambda/iQuality,
+                            iInterRadiusRs, iOuterRadiusRs,
+                            iRedShiftColorExponent, iRedShiftIntensityExponent);
+            }
+        // --- 落点白点（NPGS 逐行移植的调试可视化）：沿 Ingoing 主零矢量内落的白色
+        //     光点，用于直观看清光线传播与坐标系切换。NPGS 原版此处是注释状态（默认不画），
+        //     故本移植版默认关闭，由 Kerr Extras 面板「Falling dot」复选框开启。 ---
+        if (iShowFallingDot != 0) {
+            Result = DrawFallingWhiteDot(Result, X, LastX, P_cov, LastP_cov,
+                        PhysicalSpinA,
+                        PhysicalQ, isoutgoing,
+                        CurrentUniverseSign, -dLambda/iQuality);
+        }
+
+        // --- 致密星表面（NPGS 逐行移植）：iDensestarsurfaceR != 0 时启用，
+        //     与 NPGS 同样要求裸奇点或表面半径大于外视界（否则被视界吞没不可见） ---
+        if (iDensestarsurfaceR != 0.0 && (bIsNakedSingularity || iDensestarsurfaceR > EventHorizonR)
+            && int(33+iInWhichUniverse-universeoffset)%3==0)
+        {
+            Result = DensestarColor(Result, X, LastX, P_cov, LastP_cov,
+                        PhysicalSpinA,
+                        PhysicalQ, isoutgoing,
+                        CurrentUniverseSign, -dLambda/iQuality);
+        }
+
+        // --- 时空网格（NPGS 逐行移植）：iGrid=1 → GridColor（真实坐标），
+        //     iGrid=2 → GridColorSimple（简易版 + ShowInnerGrid 遮罩）。
+        //     网格可视化最大延拓结构（内外视界/宇宙分区），仅在最大延拓或近距离观察时有意义 ---
+        if (iGrid == 1)
+        {
+            Result = GridColor(Result, X, LastX,
+                        P_cov, E_conserved,
+                        PhysicalSpinA,
+                        PhysicalQ, isoutgoing,
+                        CurrentUniverseSign);
+        }
+        else if (iGrid == 2)
+        {
+            Result = GridColorSimple(Result, X, LastX, P_cov, LastP_cov,
+                        PhysicalSpinA,
+                        PhysicalQ, isoutgoing,
+                        CurrentUniverseSign, -dLambda/iQuality, ShowInnerGrid);
+        }
          }
         if (Result.a > 0.99) { bShouldContinueMarchRay = false; bWaitCalBack = false; break; }
         
@@ -3195,12 +4785,26 @@ void main()
         BgDir      = res.EscapeDir;
     }
 
-    if (Status > 0.5 && Status < 2.5) {
+    // 背景采样门控与 NPGS BlackHole_composite L143 逐行对齐：除常规星空(Status 1/2)外，
+    // Status>3.5（出白洞——来自上个宇宙的光）也要采背景，SampleBackground 内按 offset
+    // 取上一层盒。普通版 BlackHole.frag 的 main 无此分支；缺失时白洞喉道区应见的
+    // 「上个宇宙天空」整片不采样 → 中心天体不显示。
+    if (FinalColor.a < 0.99 && ((Status > 0.5 && Status < 2.5) || Status > 3.5)) {
         vec4 Bg = SampleBackground(BgDir, Shift, Status);
-        // 前向散射：被盘消光的那部分背景光（≈Bg·FinalColor.a，此时 alpha 仍为盘体积累积值）
-        // 按 iDiskScatter 比例单次散射回视线（albedo ≤1 时能量守恒）。仅逃逸路径执行，
-        // 吸收（Status=0，阴影）不经过此处保持纯黑；亮背景下冷暗盘区自动泛背景微光
-        FinalColor.rgb += Bg.rgb * iDiskScatter * FinalColor.a;
+        // 负能量状态位（小数 .2）：背景反相；非白洞模式直接置零（NPGS composite L146-155 同款）
+        bool IsPositiveEnergy = abs(Status - round(Status)) < 0.1;
+        if (!IsPositiveEnergy) {
+            float cMax = max(max(Bg.r, Bg.g), Bg.b);
+            float cMin = min(min(Bg.r, Bg.g), Bg.b);
+            Bg.rgb = vec3(cMax + cMin) - Bg.rgb;
+            if (iWhitehole == 0) Bg = vec4(0.0);
+        }
+        if (Status > 0.5 && Status < 2.5) {
+            // 前向散射：被盘消光的那部分背景光（≈Bg·FinalColor.a，此时 alpha 仍为盘体积累积值）
+            // 按 iDiskScatter 比例单次散射回视线（albedo ≤1 时能量守恒）。仅常规星空逃逸
+            // 路径执行（NPGS composite 的白洞分支无此项）；吸收（Status=0）不经过此处保持纯黑
+            FinalColor.rgb += Bg.rgb * iDiskScatter * FinalColor.a;
+        }
         // 背景按体积光透过率逐通道叠加（蓝光被遮挡最快，红光最慢）
         FinalColor += 0.9999 * Bg * vec4(pow(1.0 - FinalColor.a, 1.0),
                                          pow(1.0 - FinalColor.a, 1.6),

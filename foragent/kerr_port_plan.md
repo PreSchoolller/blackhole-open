@@ -1,5 +1,298 @@
 # 克尔黑洞（Kerr）移植计划书 —— 借鉴 NPGS 完整实现
 
+> **状态(2026-10-06):裁剪功能首批恢复完成（分支 `kerr-restore-cut-features`）。**
+> 背景：`c085332`（Phase 1.5 结构化重构）一次删掉 kerr.frag 2139 行，§2.5 裁剪清单里的
+> 功能随之整体消失。但 `KerrParams` 字段与 `NPGS Orig` 面板控件从未删除 → 这些开关在
+> KERR 模式下是**死开关**（点按无反应）。本次按"恢复被抛弃功能"的要求，从
+> `D:\CodingSpace\IdeaProjects\NPGS\NPGS\Sources\Engine\Shaders\BlackHole_common.glsl`
+> （权威原版，与仓库内 `resources/shaders/npgs/` 冻结副本同源）逐行移植回以下 **4 类功能**
+> （`iPolarization` / `iGrid` / `iDensestar*` / 落点白点），只改 `resources/shaders/kerr.frag`
+> 一个文件——`KERR_NPGS` 的冻结原版路径与 Java 侧均未触碰。
+>
+> - **偏振（iPolarization=1 色相显示 / 2 偏振片）**：补回 `GetWalkerPenrose`、
+>   `SolvePolarization`，新增 `BuildTransversePolarizationBasis`（把两位移矢量正交化成
+>   与光子横向的四维偏振矢量，抽成共享函数替代原版在两处内联的重复代码）；
+>   `GetInitialMomentum` 加 `out vec2 WP_CamX/WP_CamY` 输出相机屏幕基底；`DiskColor`/`JetColor`
+>   补回 Stokes Q/U 逐样本累积（`JetColor` 签名同步补 3 个参数，与 `DiskColor` 对齐）。
+>   `TraceRay` 原有的输出端分支（L2941 起）本来就在，本次只补输入端。
+> - **时空网格（iGrid=1 GridColor / 2 GridColorSimple）**：两函数共 510 行，自包含无外部依赖，
+>   按原版行号原样搬回；`TraceRay` 主循环补 `if(iGrid==1)…else if(iGrid==2)` 分派。
+>   `ShowInnerGrid` 遮罩与 `iGrid==0` 剔除分支在裁剪时已保留，无需改动。
+> - **致密星表面（iDensestarsurfaceR≠0）**：补回 `DensestarColor` + 其依赖 `Fbm_Standalone`。
+> - **落点白点**：补回 `DrawFallingWhiteDot` + 依赖 `GetIngoingNullParticlePos`、`GetDotDistSq`。
+>   **注意**：原版此处是注释状态（默认不画），本移植版按"恢复功能"的要求**已启用**；
+>   如需关闭，注释掉 `TraceRay` 里那一块调用即可。
+>
+> **移植适配（签名差异，共 21 处）**：原版 `ComputeGeometryScalars(7参)` → 本移植版 `(5参)`；
+> `KerrSchildRadius(3参)` → `(2参)`；`transformKerrSchild_YSpin(7参)` → `(4参)`。
+>
+> > **[2026-10-06 更正] 上文原先记录的"待验收语义风险"是误报，现已核实无问题。**
+> > 当时写的是"原版渡 `HitPointSign`/`diskSign`，本移植版该参语义为宇宙侧符号"——**这个推断错了**。
+> > 回查 NPGS 原始调用点后确认：`hitSign` 在 `ImageDiskColor` 内**是局部计算的**
+> > （npgs L2640 `float hitSign = (length(DiskHitPos.xz) < abs(PhysicalSpinA)) ? -StartStepSign
+> > : StartStepSign;`），且 `ComputeGeometryScalars` 的**第 3 参本就是 `r_sign`**，
+> > 槽位对得上。搬回后逐行核对，`ImageDiskColor` 的 `StartStepSign` 生命周期与原版完全一致
+> > （L3178 初始化 → L3228 环内翻转 → L3241 取用），`DensestarColor`、`GridColor` 同构。
+> > **教训**：误报来自引用了自己上一轮的小结文案（"原版传 HitPointSign"）而未回原始代码核对——
+> > 转述会漂移，结论必须落到原始调用点。
+
+>
+> **验证**：shaderc 编译通过（368,368 字节 SPIR-V，离线 `ShaderCompiler` 与运行时 shader-cache
+> 产物字节数一致）；`mvn clean package` BUILD SUCCESS；`java -jar` 启动无着色器报错。
+> 四个功能默认均关闭（`gridMode=0`/`polarization=false`/`densestarRadiusRs=0`），
+> 不影响既有默认画面。
+>
+> ---
+>
+> **状态(2026-10-06) 第二批：多天空盒 + 宇宙变体选层 + 白洞/最大延拓接线**
+>
+> 第一批只恢复了着色器函数体，但随即发现**接线在 Java 侧早被剪断**——只补着色器是"死开关
+> 换个死法"。`KerrRender` 的 UBO 打包器里 8 个字段被写死为常量，GUI/`KerrParams` 根本到不了
+> 着色器。本次一并接通：
+>
+> **A. KerrRender UBO 接线（12 个字段解冻）**
+> | 字段 | 原值 | 现读 |
+> |---|---|---|
+> | `iDEBUG` | `0` | `kp.debugMode` |
+> | `iWhitehole` | `0` | `kp.whitehole` |
+> | `iInWhichUniverse` | `0` | `kp.universeIndex` |
+> | `iGrid` | `0` | `kp.gridMode` |
+> | `iEnableShadowCulling` | `0` | `kp.shadowCulling` |
+> | `iPolarization` | `0` | `kp.polarization`（见下方"未暴露"） |
+> | `iUseImageDisk` | `0` | `kp.useImageDisk` |
+> | `iUniverseSign` | `1.0f` | `kp.universeSign` |
+> | `iDensestarsurfaceR` + 4 个致密星指数 | `0/4/1/4/1` | `kp.densestar*` |
+> | `iImageRotationSpeed` / `iPolarizationAngle` | `0.0f` | `kp.imageRotationSpeed` / `kp.polarizationAngle` |
+>
+> 另补 **宇宙符号双向交换**（照搬 NpgsRender）：`geodesic.isUniverseSignDirty()` →
+> `kp.universeSign`；`isActive()` 时反向同步。缺这条则最大延拓穿越后的 `-1` 到不了着色器，
+> 反宇宙选层（Antiground*）永远不触发。
+>
+> **B. 六套天空盒（`KerrRender.java`）+ 选层（`kerr.frag`）**
+> - 描述符布局 set1 从"单层 b1"扩为 **b1..b6 = Background0/Antiground0/Background1/
+>   Antiground1/Background2/Antiground2**，顺序与 `npgs` 冻结原版逐槽位对齐；
+>   `KerrRender` 载入 `resources/textures/npgs/` 下六套盒（Universe 1024²×3 + Antiverse 2048²×3）。
+> - `SampleBackground` 换成 NPGS 原版选层逻辑：`offset`/`useContground` 由 `Status>3`
+>   （逃逸自上个宇宙的光）反推，`isAntiverse = mod(rStatus,3)==2`，再按
+>   `int(iInWhichUniverse+3+useContground)%3` 在三个变体里选盒（Background 或 Antiground）。
+>   **唯一差异**：固定 `textureLod(...,0.0)`，NPGS 用 `textureQueryLod` 逐面取 mip；
+>   本项目盒有完整 mip 链，若要更贴原版可改回 queryLod（观感差异待实测评估）。
+> - **b9 语义撞车修复**：原 b9 注释写"贴图盘占位"却绑历史视图（与 shader 的 `iHistoryTex`
+>   同名槽位冲突）。现 b9 绑 NPGS 原版贴图盘 `Disk/R.jpg`（`iUseImageDisk` 门控）。
+> - **显存代价**：六套盒解码 + 完整 mip 链约 **480MB 显存**（Universe 3×~33MB +
+>   Antiverse 3×~133MB）。与 NPGS 模式同量级；若两种模式都初始化则接近翻倍。
+>   如需省显存可改惰性加载（仅在 Whitehole/选层需要时载入）。
+> - **`DualSkybox` 取舍**：项目自有的「星空/山海」双盒仍换绑在 **b1**（= 默认选层
+>   `%3==0`），故该 GUI 开关在默认选层下仍生效；切到 1/2 号宇宙变体时它不参与
+>   （那两层恒用 NPGS 原装盒），属已知取舍，已在 `rebindSkyboxDescSets` 注释说明。
+>
+> **C. 贴图盘 `ImageDiskColor`（171 行，第三批补齐）**
+> 六套盒与 b9 接线到位后，`ImageDiskColor`（NPGS 2519–2689）也可整体搬回——自包含无外部依赖。
+> 调用点按 NPGS 原位置放在"宇宙选层"门控内、且先于致密星/网格；`iUseImageDisk` 与
+> `iImageRotationSpeed` 均已在 A 段接通，故 NPGS Orig 面板的「Use image disk (R.jpg)」
+> 复选框现在真正生效。
+> 顺带修一处移植期遗留：`GetKeplerianAngularVelocity` 在本移植版被简化为
+> `(Radius, Rs)` 两参（自旋/电荷走全局 `PhysicalSpinA`/`PhysicalQ`），NPGS 原版是四参，
+> 搬回时按本移植版签名归一。
+>
+> **D. 未暴露/待定**
+> - `iPolarization=2`（马吕斯偏振片模式）：`KerrParams.polarization` 是 boolean，
+>   GUI 只能表达"关/开"，故现映射为 1（EVPA 色相显示）。要暴露 2 需在
+>   `Panels` 的 NPGS Orig 面板把复选框换成 0/1/2 三档滑条。
+> - `NpgsRender` 侧天空盒绑定序经核对**正确**（数组顺序 [U0,A0,U1,A1,U2,A2] ↔ b1..b6 一致），
+>   无绑定错位问题。
+> - 六套盒固定 `textureLod(...,0.0)`（NPGS 用 `textureQueryLod` 逐面取 mip）；盒有完整
+>   mip 链，若要更贴原版可改回 queryLod。
+>
+> **验证（第三批后）**：shaderc 编译通过（**387,432 字节** SPIR-V）；`mvn clean package`
+> BUILD SUCCESS；以 `npgs.verbatim=false` 强制进 KERR 模式实测，运行时 shader-cache 产物
+> **387,432 字节与离线编译逐字节一致**，无 Vulkan 验证层报错，六套盒 + 贴图盘 + 12 个
+> 描述符绑定全部就绪。
+>
+> **E. 面板可达性修复（第四批，用户实测反馈"面板没改呢！调不了"）**
+> 前三批把功能与接线都接通了，却漏了最后一步：**这些开关全在 `NPGS Orig` 面板里，而该面板
+> 被 `Panels.buildFrame` 门控为"仅 KERR_NPGS 模式渲染"** —— KERR 模式下根本看不见，等于
+> 还是调不了。
+> - **做法**：把该面板的控件体提取为 `renderKerrExtraControls(kp, includeOrigOnly)`，
+>   由两个面板共用同一份 `KerrParams` 字段：
+>   - `NPGS Orig`（KERR_NPGS，`includeOrigOnly=true`）= 原有全部控件；
+>   - **`Kerr Extras`（KERR，新增）** = 同样的网格/选层/白洞/反宇宙侧/致密星/贴图盘/偏振/调试。
+>   - `includeOrigOnly` 只控制"仅原版 shader 消费"的项（偏振片角度滑条）。
+> - 同时删掉替换后残留的旧内联方法体（不留死代码），并给 `iDEBUG` 加注：**模式 2 未移植**，
+>   KERR 模式下选中时面板会提示改用 NPGS 模式。
+> - 控件存活审计（逐个确认 kerr.frag 中有真实消费点）：`iInWhichUniverse`(10 处)、
+>   `iWhitehole`(18)、`iGrid`(10)、`iDensestarsurfaceR`(7)、`iUseImageDisk`(6)、
+>   `iUniverseSign`(3)、`iImageRotationSpeed`(3)、`iPolarizationAngle`(2)、
+>   `iEnableShadowCulling`(1，L3481)、`iDEBUG`(1/3/4 共 12 处)。
+> - **截图实测确认**：KERR 模式下 `Kerr Extras` 面板正常显示四个分区
+>   （Spacetime structure / Dense star surface / Image disk / Polarization · Debug）。
+>
+> **F. 第五批：补齐上一批"接通了但功能不全"的三处**
+> 第四批把 `iEnableShadowCulling` / `iPolarization` / `iDEBUG` 都接到 GUI 后，暴露出这三个
+> 开关本身还不完整，勾了会出错误结果或没反应。本批逐个补齐：
+>
+> 1. **阴影剔除四函数（正确性隐患，优先）** —— `SolveCubicMaxReal` / `SolveQuarticU` /
+>    `GetDropFrameAngle` / `GetShadowHalfAngleRN` 在 Phase 1.5 被留成 `return 0.0` 空壳
+>    （当时 `iEnableShadowCulling` 恒 0、分支不可达，属"安全"省略）。开关一接通，这些 0
+>    就变成**错误的阴影几何比较量**——阴影角恒 0，剔除逻辑会误判。已按 NPGS 原版
+>    （L3597–3698）恢复实现：光子球半径 → 临界碰撞参数 b_c → 静态观者 sin/cos（含光子球
+>    内外 Cos 符号判定）→ 落体观者相对论光行差。这几个函数纯自包含数学，无外部依赖。
+> 2. **偏振模式 0/1/2** —— `KerrParams.polarization` 由 `boolean` 改为
+>    **`int polarizationMode`（0=关 / 1=EVPA 色相显示 / 2=马吕斯偏振片）**，面板复选框换成
+>    三档滑条，偏振片角度滑条仅模式 2 显示。`KerrRender` 与 `NpgsRender` 两处打包同步改为
+>    读该字段——**原版 shader 同样实现了 mode 2**（npgs L4914/4921），故 KERR_NPGS 一并受益。
+> 3. **调试视图 2（初始动量可视化）** —— 补回 `DebugInitialMomentum`（96 行，NPGS L834–929）
+>    并在 TraceRay 中按原版位置插入 `if (iDEBUG == 2 && bShouldContinueMarchRay)` 接管分支
+>    （紧跟初始动量构造、早于一切盘/网格累加，设 Status=3 直接输出）。
+>    面板里的"mode 2 not ported"提示已删除，并给 1/2/3/4 补了语义标签。
+>    顺带清理：`renderKerrExtraControls` 的 `includeOrigOnly` 参数在两个面板控件完全一致后
+>    已无用途，删除（不留死参数）。
+>
+> **验证（第五批后）**：shaderc 编译通过（**407,140 字节** SPIR-V）；`mvn clean package`
+> BUILD SUCCESS；KERR 模式实测运行时产物 **407,140 字节与离线编译一致**，无 Vulkan 验证层
+> 报错，渲染正常。**至此 `kerr.frag` 内已无任何 `return 0.0` 桩函数**（仅剩
+> `AdvanceToMarchingBoundary` 中两处合法的提前返回）。
+>
+> **G. 逐功能截图实测（第六批：把"编译通过"升级为"确认真的渲染出来"）**
+> 教训来自第四批——"编译通过"不等于"真能用"（当时面板不可达就是编译全过、功能全废）。
+> 故本轮逐个把 `KerrParams` 默认值临时打开、跑起来截取**应用窗口**（`PrintWindow`
+> + `PW_RENDERFULLCONTENT`，无需最大化）逐个确认，验证后 `git checkout` 还原：
+>
+> | 功能 | 实测结果 |
+> |---|---|
+> | 时空网格 `gridMode=1` | ✅ 渲染出清晰的极坐标网格（同心环 + 辐射线） |
+> | 致密星 `densestarRadiusRs=6` | ✅ 带黑体着色的湍流表面球体，明显亮于吸积盘 |
+> | 偏振 `polarizationMode=1` | ✅ 彩虹色 EVPA 色相映射铺满盘面——整条偏振链路工作 |
+> | 贴图盘 `useImageDisk` | ✅ 面板勾选态正确，盘面着色随贴图变化 |
+> | 白洞 `whitehole=true` | ✅ 最大延拓下追迹上限提至 1145 步，无崩溃/无验证层报错 |
+> | Kerr Extras 面板 | ✅ 四分区控件齐全、可达 |
+>
+> **顺带修正一处越权（用户未要求但确属我的问题）**：第五批把落点白点
+> `DrawFallingWhiteDot` **默认设为开启**了，而 NPGS 原版该调用是注释状态（默认不画），
+> 等于往默认画面里塞了个没有开关的调试元素（实测截图中黑洞中心可见小白点）。
+> 现补 `iShowFallingDot` 开关（面板 `Falling dot (debug viz)` 复选框，**默认关**）：
+> - 新增 UBO 字段 `int iShowFallingDot;` —— **占用 std140 结构对齐产生的尾部填充**：
+>   前面字段实际 396B、缓冲区 400B，补上后内容恰为 400B，**既有字段偏移一律不变**，
+>   NPGS 原版声明更短、自然忽略尾部字节，故无需改 `BH_ARGS_SIZE` 或任何其他文件。
+> - 仅 `kerr.frag` 消费（NPGS 原版无此逻辑，故 `NpgsRender` 不必写该字段）。
+>
+> **验证（第六批后）**：shaderc 编译 **407,316 字节** SPIR-V，UBO 内容 400B 无溢出；
+> `mvn clean package` BUILD SUCCESS；KERR 模式默认状态实测渲染干净（小白点已消失），
+> 运行时空闲稳定。所有功能默认关闭，默认画面与恢复前一致。
+>
+> **H. 第七批：核对 hitSign（误报）+ 消除赤道穿越三处重复 + 暴露 iDEBUG 5**
+>
+> 1. **`hitSign` 语义核对 → 确认无问题**（详见上文 §2.5 后的更正块）。原先记录的"语义风险"
+>    是我引用自己的转述而非原始代码造成的误报；`diskSign`/`hitSign` 一律是**函数内局部计算**，
+>    与原版逐行一致。
+> 2. **赤道穿越检测三处重复 → 归一为一份**。同一逻辑（Y 变号 + 柱面半径 ρ<|a| 判据）在
+>    `kerr.frag` 里存在三份实现：
+>    - `GetIntermediateSign`（NPGS 逐字移植，RK4 子步用，**保留不动**，属原版代码）
+>    - `CheckEquatorialCrossing`（Phase 1.5 计划书 §1.5.2 明确要提取的共享函数，
+>      **但提取后从未接线，调用者为 0 = 死代码**）
+>    - `TraceRay` 主循环内的内联展开（原 L4415-4419）
+>    现将主循环那处内联替换为 `CurrentUniverseSign = CheckEquatorialCrossing(LastX, X,
+>    CurrentUniverseSign);` —— 既消除重复，也让这个当年提取出来的函数真正投入使用。
+>    语义完全等价（逐行比对过判据与插值公式）。
+> 3. **`iDEBUG == 5` 暴露**：致密星表面专用的"八卦限颜色 + 经纬网棋盘格"调试视图，shader
+>    分支（L2956）本来就在，只是面板滑条上限卡在 4 够不到。上限改为 5 并补了标签文案。
+>
+> **验证（第七批后）**：shaderc 编译 **407,716 字节** SPIR-V；`mvn compile` 通过；
+> `CheckEquatorialCrossing` 现有 1 处真实调用。
+>
+> **I. 第八批：六套天空盒惰性加载（可选，`kerr.lazySkybox`）**
+> 六套盒解码 + 完整 mip 链约 480MB 显存，而默认配置（`iInWhichUniverse=0`、正宇宙）
+> 只用到 b1/b2 两套。新增配置键 **`kerr.lazySkybox`（jar 内默认 `true`）**：
+> - `true`：init 只载 `Background0/Antiground0`（约 160MB），其余在用户把面板
+>   `Universe #` 切到 1/2 时由 `ensureSkyboxesForUniverse` 按需补载并重绑 b1..b6。
+>   选层公式 `(iInWhichUniverse+3+useContground)%3` 保证变体 `u` 只用槽位 `2u`/`2u+1`，
+>   故按变体成对加载；**已载入的盒不卸载**（来回切换不反复重传，最坏退化为全量加载）。
+> - `false`：init 一次载齐六套，与 NPGS 原版行为一致。
+> - 惰性期间未载入的槽位**始终绑着已载入的 0 号盒**（init 绑定循环里的 null 回退），
+>   故描述符集任何时候都不含空句柄，不会触发验证层报错或采样未定义。
+>
+> **验证**：以 `log.level=DEBUG` 观察 `CubeTexture uploaded` 实际加载数——
+> 默认（Universe #0）只载 `Universe0Skybox` + `Antiverse0Skybox`（U1/A1/U2/A2 未载）；
+> 把 `universeIndex` 置 2 后，首次进入帧循环按需补载 `Universe2Skybox` +
+> `Antiverse2Skybox`，随后每帧提前返回（`loadedUniverseIndex` 生效）；默认状态渲染正常。
+>
+> > **过程教训（同一天内把同一个错犯两次）**：本轮我曾两次把"查询太早 / 输出还没到"
+> > 误判为"功能没生效"。第二次更严重——用了 `Select-String ... | Select-Object -First N`
+> > 截取日志，该管道取够 N 行后会**提前终止并杀掉 java 进程**（`exit code: 1`），
+> > 结果我既误判又亲手打断了程序。**读运行日志不要用 `-First` 截断正在写日志的进程管道**，
+> > 结论必须建立在确认输出已完整到达之上。
+>
+> **J. 第九批（用户实机反馈的两个 bug，同一根因）**
+> 用户报告：单独开白洞时中心"该有的东西"没出现（原版看得到、**两极尤其明显**）；
+> 白洞 + 反宇宙时**整屏全黑**。
+>
+> **根因**：`KerrSchildRadius` 返回**带符号**半径（`r_sign * sqrt(r2)`），反宇宙侧
+> `r_sign = iUniverseSign = -1` → `CameraStartR` / `geo.r` 都是**负值**；而白洞的两处
+> `universeoffset` 自增判定写的是 `< InnerHorizonR`（正值），**负半径下恒成立**：
+> ```glsl
+> L4205 if(iWhitehole==1 && ... && CameraStartR < InnerHorizonR) universeoffset++;
+> L4298 if(iWhitehole==1 && ... && geo.r < InnerHorizonR && lastR > InnerHorizonR) universeoffset++;
+> ```
+> 于是反宇宙下 `universeoffset` 被误加到 2，逃逸分支 `Status = 2.0 + 3.0*2 = 8.0`，
+> 而 `main` 的背景合成门控是 `Status > 0.5 && Status < 2.5` → **背景整块被跳过 → 全黑**。
+> 中心天体同理：它是反宇宙侧看到的光子环，也被同一门控吃掉。
+>
+> **修复**：两处改按半径**大小**比较（`abs(CameraStartR)` / `abs(geo.r)` / `abs(lastR)`）。
+>
+> **验证**（两模式同参数**截图比对**）：whitehole=1 + antiverse=-1 赤道视角：修复前纯黑 →
+> 修复后正确渲染反宇宙山海盒，与原版 `KERR_NPGS` 一致；极点 88° 视角：中心明亮光子小环
+> 正常显示，与原版一致；whitehole=1 + 正宇宙：不受影响；默认配置无回归。
+>
+> **顺带新增配置键**（便于切换/复现，默认值与原行为一致）：
+> `kerr.whitehole` / `kerr.universeSign` / `kerr.debugMode` / `ui.hidden`
+> （`ui.hidden=true` 启动即隐藏面板，F1 仍可切换——观察纯渲染画面用）。
+>
+> > **⚠️ 方法论教训（本轮最该记住的一条）**：调试期间我**多次用截图文件的字节大小**
+> > 当作画面内容的证据（"10KB 所以是黑的"），连续推出错误结论——**纯色画面同样很小**
+> > （纯绿填充只有 13KB，被我误判为黑屏）。**尺寸只能说明"是否单色"，不能说明颜色**；
+> > 判断画面内容**必须看图**，不能拿文件大小当代理指标。
+>
+> **至此 §2.5 裁剪清单中的功能项全部恢复**（多天空盒选层、白洞/最大延拓、贴图盘
+`ImageDiskColor`、致密星、网格、偏振、落点白点），仅下列"项目主动保留的差异"仍然存在：
+固定 `textureLod(...,0.0)`（NPGS 用 `queryLod`）、鱼眼/落体观者的 `ObserverMode` 细节、
+以及本项目自有的扩展开关。
+>
+> **K. 第十批（用户实机反馈：南极正宇宙白洞中心亮斑仍缺失——第九批根因只对了一半）**
+> 用户截图比对：同机位（南极轴上 18 Rs、whitehole=1、正宇宙），`KERR_NPGS` 中心有亮蓝白
+> 斑（上一个宇宙的天空经喉道压缩成像），KERR 中心仍纯黑。
+>
+> **根因**：`main` 的背景合成门控抄的是**普通版** `BlackHole.frag.glsl` L33
+> （`Status > 0.5 && Status < 2.5`）；而 verbatim 模式默认走 prepass+**composite**
+> 路径（`npgs.direct=false`），其 `BlackHole_composite.frag.glsl` L143 的门控是
+> `(0.5 < Status < 2.5) || Status > 3.5`——**Status 4/5（出白洞、来自上个宇宙的光）也要
+> 采背景**，`SampleBackground` 内按 `offset=round((rStatus-1)/3)` 取上一层盒。本移植版
+> 的 main 从一开始就没有这个分支 → 正宇宙下出喉道的 ray `universeoffset=1`、
+> `Status=1+3=4` → 背景被跳过 → 喉道区整片黑。第九批修的 `abs()` 半径比较只救了
+> **反宇宙侧**的误计数（Status 被抬到 8 导致的全黑），正宇宙侧缺的是这整个分支，
+> 当时"88° 视角已与原版一致"的验收恰好没覆盖正轴视角。
+>
+> **修复**（`kerr.frag` main 一处 + `KerrRender` 一处）：
+> 1. 背景门控对齐 composite：`FinalColor.a < 0.99 && ((0.5 < Status < 2.5) || Status > 3.5)`；
+>    并逐行移植 L146-155 的**负能量状态位**处理（小数 `.2` → 背景反相；
+>    `iWhitehole==0` 时置零）。项目自有的 `iDiskScatter` 前向散射仍只作用于常规星空
+>    分支（NPGS composite 的白洞分支无此项，保持一致）。
+> 2. 惰性天空盒连带：白洞路径采的是「上一个宇宙」`(u+2)%3` 那对盒，`kerr.lazySkybox`
+>    默认只载 U0/A0 → 亮斑会采到 fallback 盒。`ensureSkyboxesForUniverse` 增加
+>    `whitehole` 参数，开启时补载该对并重绑（`loadedWhitehole` 参与去重判定）。
+>
+> **验证**：SpvCheck 离线编译通过（**409,340 字节** SPIR-V）；`mvn compile` 通过；
+> **用户实机验收通过**（2026-10-06，同机位南极对比：中心亮斑出现、与原版一致）。
+>
+> > **方法论补注**：本批根因不在物理代码（TraceRay/universeoffset 全对），而在**入口
+> > shader 门控**——本移植版把 main 抄自普通版 `BlackHole.frag`，而 verbatim 默认走
+> > `BlackHole_composite`，两套入口的背景门控差一个 `|| Status > 3.5`。第九批在
+> > TraceRay 里排查半天无果（该处本来就没错）。教训：**对"同一逻辑在 NPGS 里有两份
+> > 入口实现"要保持警觉**，对拍时要先确认对的是哪一份入口。
+>
+> **工具注**：`SpvCheck`（测试工具）原先经 `MemoryStack` 传源码，其默认帧仅 64KB，
+> kerr.frag ~250KB 直接 `OutOfMemoryError("Out of stack space")`——改为
+> `MemoryUtil.memUTF8` 堆外分配（与运行时 `ShaderCompiler` L78-80 同款处理）。
+>
 > **状态(2026-09-19):Phase 5 完成并合并 dev(d791fec),用户运行反馈两轮已闭环
 > (77f0798 修 UBO 槽位错位/标架折叠乘序/高分屏缩放;b967e39 修 G 进出测地模式视角翻到身后)。
 > 另:8edb7e0(2026-09-23)修测地模式(mode=-1)星空背景旋转 90°——EscapeDir 出口多乘一次

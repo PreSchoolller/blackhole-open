@@ -93,16 +93,16 @@ public class KerrParams {
     /** iUniverseSign：相机所在空间侧（+1 正宇宙 / -1 反宇宙）——每条光线宇宙符号的种子
      *  （随行进中的赤道穿越翻转逻辑演化）。注意：测地相机穿越虫洞不会自动翻转此值
      *  （引擎未接线状态跟踪），穿越观察时需在此手动切换 */
-    public float universeSign = 1.0f;
+    public float universeSign = EngCfg.getInstance().getKerrUniverseSign();
     /** iWhitehole：最大延拓（1=启用白洞/多宇宙解；配合测地相机穿越内视界观察 II 区） */
-    public boolean whitehole = false;
+    public boolean whitehole = EngCfg.getInstance().isKerrWhitehole();
     /** iEnableShadowCulling：阴影剔除优化（原版默认 0） */
     public boolean shadowCulling = false;
     /** iDEBUG：调试视图 0=关 / 1 / 2 / 3=步数热图 / 4 */
-    public int debugMode = 0;
-    /** iPolarization：偏振输出开关（配合 iPolarizationAngle 偏振片角度） */
-    public boolean polarization = false;
-    /** iPolarizationAngle：偏振片角度 */
+    public int debugMode = EngCfg.getInstance().getKerrDebugMode();
+    /** iPolarization：偏振输出模式 0=关 / 1=EVPA 色相显示 / 2=偏振片（马吕斯定律，配合 iPolarizationAngle） */
+    public int polarizationMode = 0;
+    /** iPolarizationAngle：偏振片角度（仅 mode 2 生效） */
     public float polarizationAngle = 0.0f;
     /** iDensestarsurfaceR：致密星表面半径（Rs 倍数；0=关，>视界半径即渲染中子星表面——原版独有） */
     public float densestarRadiusRs = 0.0f;
@@ -118,6 +118,9 @@ public class KerrParams {
     public boolean useImageDisk = false;
     /** iImageRotationSpeed：贴图盘整体自转角速度（NPGS 初始值 ≈0.0078） */
     public float imageRotationSpeed = 0.0076561966f * (3.06f / 3.0f);
+    /** iShowFallingDot：落点白点调试可视化（本项目扩展字段，占 UBO 尾部 std140 对齐填充；
+     *  默认关——NPGS 原版此调用为注释状态） */
+    public boolean showFallingDot = false;
 
     /** 盘时间倍率（克尔侧的 TimeRate 镜像；史瓦西侧同名滑条驱动的是测地线相机，互不相干） */
     public float timeScale = EngCfg.getInstance().getKerrTimeScale();

@@ -39,8 +39,8 @@ import org.joml.Vector3f;
  */
 public class Panels {
 
-    /** GUI 面板显隐（F1 切换，默认显示） */
-    private boolean visible = true;
+    /** GUI 面板显隐（F1 切换）。可通过 ui.hidden=true 令启动即隐藏，便于观察/截图纯渲染画面 */
+    private boolean visible = !EngCfg.getInstance().isUiHidden();
     /** 本帧 GUI 是否捕获鼠标（buildFrame 更新；捕获中不响应右键切视角等相机鼠标操作） */
     private boolean mouseHover;
     /** 帧耗时累计（毫秒，用于平均 FPS：遥测面板 + 控制台周期读数共用） */
@@ -119,8 +119,12 @@ public class Panels {
             var mode = engCtx.scene().getSpacetime();
             if (mode == Scene.SpacetimeMode.KERR || mode == Scene.SpacetimeMode.KERR_NPGS) {
                 renderKerrPanel(engCtx.scene());
+                // 进阶开关（网格/选层/白洞/致密星/贴图盘/偏振/调试）两模式都要能调：
+                // 移植版走 Kerr Extras，原版复刻走 NPGS Orig（同一份控件体，字段共用）
                 if (mode == Scene.SpacetimeMode.KERR_NPGS) {
                     renderNpgsPanel(engCtx.scene());
+                } else {
+                    renderKerrExtrasPanel(engCtx.scene());
                 }
             } else {
                 renderSchwarzschildPanel(engCtx.scene());
@@ -564,10 +568,9 @@ public class Panels {
     }
 
     /**
-     * NPGS 原版专有参数面板 —— 仅 KERR_NPGS（原版复刻）模式渲染。这些参数对应的 shader
-     * 代码在移植版中被裁剪（时空网格/致密星表面/白洞延拓/偏振/调试视图/贴图盘等），
-     * NpgsRender 每帧打包进 BlackHoleArgs UBO 对应字段，原版 shader 原生消费。
-     * 默认值 = NPGS Application.cpp 初始化值（全关）。
+     * NPGS 原版复刻模式（KERR_NPGS）的参数面板。控件体与 {@link #renderKerrExtrasPanel} 完全相同
+     * ——两模式共用一份 {@link KerrParams} 字段，且这些功能的 shader 代码两边都已具备
+     * （移植版侧按"恢复被裁剪功能"已补回 kerr.frag）。保留独立窗口只为沿用既有窗口位置/标题。
      */
     private void renderNpgsPanel(Scene scene) {
         KerrParams kp = scene.getKerrParams();
@@ -575,19 +578,41 @@ public class Panels {
         ImGui.setNextWindowPos(w - 250, 620, ImGuiCond.FirstUseEver);
         ImGui.setNextWindowSize(400, 420);
         ImGui.begin("NPGS Orig");
+        renderKerrExtraControls(kp);
+        ImGui.end();
+    }
 
+    /**
+     * Kerr 移植版（KERR）专属面板 —— 暴露已从 NPGS 恢复回 kerr.frag 的进阶开关。
+     * <p>
+     * 这些参数（网格/选层/白洞/反宇宙侧/致密星/贴图盘/偏振/调试）此前只在 NPGS Orig 面板里，
+     * 而该面板仅在 KERR_NPGS 模式下显示，导致 KERR 模式下无从调整。本面板把它们在
+     * KERR 模式下也暴露出来。取值与 NPGS 面板共用 {@link KerrParams} 同一份字段。
+     */
+    private void renderKerrExtrasPanel(Scene scene) {
+        KerrParams kp = scene.getKerrParams();
+        float w = ImGui.getIO().getDisplaySizeX();
+        ImGui.setNextWindowPos(w - 250, 620, ImGuiCond.FirstUseEver);
+        ImGui.setNextWindowSize(400, 420);
+        ImGui.begin("Kerr Extras");
+        renderKerrExtraControls(kp);
+        ImGui.end();
+    }
+
+    /** 两模式共用的"进阶开关"控件体（NPGS Orig 与 Kerr Extras 面板同源） */
+    private void renderKerrExtraControls(KerrParams kp) {
         int[] iv;
         float[] v;
 
         ImGui.text("Spacetime structure");
-        // 时空网格：0=关 / 1=GridColor / 2=GridColorSimple（原版独有绘制）
+        // 时空网格：0=关 / 1=GridColor / 2=GridColorSimple
         iv = new int[]{kp.gridMode};
         if (ImGui.sliderInt("##grid", iv, 0, 2)) {
             kp.gridMode = iv[0];
         }
         ImGui.sameLine();
         ImGui.text("Grid: " + (kp.gridMode == 0 ? "off" : kp.gridMode == 1 ? "GridColor" : "Simple"));
-        // 宇宙变体选层：6 套原装盒按 %3 选一套（0/1/2 三种星空）
+        // 宇宙变体选层：6 套盒按 %3 选一套（0/1/2 三种星空）
         iv = new int[]{kp.universeIndex};
         if (ImGui.sliderInt("##universe", iv, 0, 2)) {
             kp.universeIndex = iv[0];
@@ -607,7 +632,7 @@ public class Panels {
         }
 
         ImGui.separator();
-        ImGui.text("Dense star surface (orig only)");
+        ImGui.text("Dense star surface");
         v = new float[]{kp.densestarRadiusRs};
         if (sliderL("Surface radius", v, 0.0f, 20.0f, kp.densestarRadiusRs == 0f ? "off" : "%.2f Rs")) {
             kp.densestarRadiusRs = v[0];
@@ -630,7 +655,7 @@ public class Panels {
         }
 
         ImGui.separator();
-        ImGui.text("Image disk (orig only)");
+        ImGui.text("Image disk");
         if (ImGui.checkbox("Use image disk (R.jpg)", kp.useImageDisk)) {
             kp.useImageDisk = !kp.useImageDisk;
         }
@@ -638,24 +663,39 @@ public class Panels {
         if (sliderL("Image rotation", v, 0.0f, 0.05f, "%.5f")) {
             kp.imageRotationSpeed = v[0];
         }
+        // 落点白点：纯调试可视化（沿主零矢量内落的光点），NPGS 原版默认不画，故默认关
+        if (ImGui.checkbox("Falling dot (debug viz)", kp.showFallingDot)) {
+            kp.showFallingDot = !kp.showFallingDot;
+        }
 
         ImGui.separator();
         ImGui.text("Polarization / Debug");
-        if (ImGui.checkbox("Polarization output", kp.polarization)) {
-            kp.polarization = !kp.polarization;
+        // 偏振输出模式：0=关 / 1=EVPA 色相显示 / 2=偏振片（马吕斯定律）。
+        // 两种模式的 shader 分支（iPolarization==1 / ==2）在移植版与原版 shader 中均已实现。
+        iv = new int[]{kp.polarizationMode};
+        if (ImGui.sliderInt("##pol", iv, 0, 2)) {
+            kp.polarizationMode = iv[0];
         }
-        v = new float[]{kp.polarizationAngle};
-        if (sliderL("Polarizer angle", v, 0.0f, 3.14159f, "%.2f rad")) {
-            kp.polarizationAngle = v[0];
+        ImGui.sameLine();
+        ImGui.text("Polarization: " + (kp.polarizationMode == 0 ? "off"
+                : kp.polarizationMode == 1 ? "EVPA hue" : "polarizer"));
+        // 偏振片角度只在模式 2（马吕斯透射率）下参与计算
+        if (kp.polarizationMode == 2) {
+            v = new float[]{kp.polarizationAngle};
+            if (sliderL("Polarizer angle", v, 0.0f, 3.14159f, "%.2f rad")) {
+                kp.polarizationAngle = v[0];
+            }
         }
         iv = new int[]{kp.debugMode};
-        if (ImGui.sliderInt("##debug", iv, 0, 4)) {
+        if (ImGui.sliderInt("##debug", iv, 0, 5)) {
             kp.debugMode = iv[0];
         }
         ImGui.sameLine();
-        ImGui.text("Debug view: " + kp.debugMode + (kp.debugMode == 3 ? " (step heat)" : ""));
-
-        ImGui.end();
+        // 1=违例区着色 / 2=初始动量可视化 / 3=步数热图 / 4=频移热图 / 5=致密星表面八卦限棋盘格
+        ImGui.text("Debug view: " + kp.debugMode
+                + (kp.debugMode == 1 ? " (violation tint)" : kp.debugMode == 2 ? " (initial momentum)"
+                : kp.debugMode == 3 ? " (step heat)" : kp.debugMode == 4 ? " (shift heat)"
+                : kp.debugMode == 5 ? " (octant checker, dense star)" : ""));
     }
 
     /**

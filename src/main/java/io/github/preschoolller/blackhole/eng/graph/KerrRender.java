@@ -34,12 +34,12 @@ import static io.github.preschoolller.blackhole.utils.Constants.SHADERS_DIR;
  *   <li>Pass B（合成管线）：本帧历史 blit 逐级生成 mip 链后，采样 8 octave 辉光
  *       （NPGS 权重）+ ColorBlend 调色链（逐行照搬 NPGS ColorBlend.frag.glsl），写交换链
  *       （kerr_composite.frag；强度 0 时输出 = 纯调色链）</li>
- *   <li>星空：单层 CubeTexture 绑定到 iBackground0(b1)（NPGS 六套盒 = Universe0/1/2 宇宙
- *       变体星空 1024² + Antiverse0/1/2 反宇宙 2048²，其 %3 选层依赖 iInWhichUniverse/白洞
- *       模式，本项目未接线故恒选 0 号层；本项目将 Universe0 用作主星空盒、Antiverse0 纹理
- *       用作山海盒，GUI 在同一 b1 槽位换绑切换，着色器零改动）；
- *       iImageTexture(b9) 绑定历史视图占位
- *       （iUseImageDisk=0 恒不采样）</li>
+ *   <li>星空：NPGS 原装六套 CubeTexture 绑定到 iBackground0/Antiground0/1/2(b1..b6)，
+ *       Universe0/1/2 = 宇宙变体星空 1024²，Antiverse0/1/2 = 反宇宙 2048²。
+ *       选层由着色器按 {@code int(iInWhichUniverse+3+useContground)%3} 决定（useContground
+ *       由逃逸光线的 Status 高位反推），反宇宙侧由最大延拓 iWhitehole 下的穿越驱动。
+ *       项目自有的「星空/山海」双盒经 DualSkybox 换绑在 b1（默认选层），两开关共存；
+ *       iImageTexture(b9) 绑定 NPGS 贴图盘 Disk/R.jpg（iUseImageDisk 门控采样）</li>
  * </ul>
  * 相机动力学：静态观者（iObserverMode=0）；测地模式（G 键）激活时切换为观者模式 -1 ——
  * 外传 GeodesicIntegrator 平行输运的四维标架（iU_up + 折叠鼠标头转的 ie1/2/3_up），
@@ -115,6 +115,25 @@ public class KerrRender {
     private long prepassSampler;
     /** 双星空盒（主星空 + 山海；GUI 在同一 set1.b1 槽位换绑切换，着色器零改动） */
     private DualSkybox dualSkybox;
+    /** NPGS 原装六套盒目录（set1.b1..b6，顺序 = NPGS 绑定序：
+     *  Background0/Antiground0/Background1/Antiground1/Background2/Antiground2，
+     *  即宇宙变体 0/1/2 与其反宇宙各一套；选层由着色器按 iInWhichUniverse 决定） */
+    private static final String NPGS_SKYBOX_DIR = "/textures/npgs/";
+    private static final String[] SKYBOX_DIRS = {
+            "Universe0Skybox", "Antiverse0Skybox",
+            "Universe1Skybox", "Antiverse1Skybox",
+            "Universe2Skybox", "Antiverse2Skybox"};
+    /** 六套 NPGS 天空盒（b1..b6 一一对应）。默认 init 时全量载入；kerr.lazySkybox=true 时
+     *  只载 0 号宇宙变体那对（U0/A0），其余在用户切换 iInWhichUniverse 时按需补载 */
+    private final CubeTexture[] skyboxes = new CubeTexture[SKYBOX_DIRS.length];
+    /** 六套盒惰性加载开关（kerr.lazySkybox） */
+    private boolean lazySkybox;
+    /** 已按需补齐到的宇宙变体号（-1 = 尚未检查；惰性模式下用于避免每帧重复检查） */
+    private int loadedUniverseIndex = -1;
+    /** 上次补载时的白洞开关状态（白洞开启需额外持有「上一个宇宙」那对盒） */
+    private boolean loadedWhitehole;
+    /** NPGS 原版贴图盘（set1.b9；iUseImageDisk 开关控制采样，对应 ImageDiskColor） */
+    private Texture2D diskTexture;
     /** 噪声哈希 LUT（64³ R8 3D；PerlinNoise 查表路径的哈希表，iNoiseLut 运行时 A/B 开关） */
     private NoiseHashLut noiseHashLut;
     /** TAA 历史 [帧插槽][ping-pong]（含完整 mip 链，供合成 pass 取辉光 octave） */
@@ -185,19 +204,36 @@ public class KerrRender {
 
         // 星空立方体贴图（一次性命令上传；双盒助手含山海盒惰性加载）
         dualSkybox = new DualSkybox(vkCtx, graphQueue);
+        // NPGS 原装六套天空盒（Universe/Antiverse × 0/1/2）：着色器按 iInWhichUniverse 选层，
+        // 反宇宙侧由 escape 光线的 Status 位驱动（最大延拓 iWhitehole=1 下才有光线逃到另一侧）。
+        // 每套各面 1024²/2048² JPG + 完整 mip 链，六套解码约 480MB 显存。
+        // kerr.lazySkybox=true 时只载默认选层真正会用到的前两套（U0/A0），其余按需补载
+        // （见 ensureSkyboxesForUniverse）；false 则一次载齐，与 NPGS 原版行为一致。
+        lazySkybox = EngCfg.getInstance().isKerrLazySkybox();
+        int eagerCount = lazySkybox ? 2 : SKYBOX_DIRS.length;
+        for (int i = 0; i < eagerCount && i < SKYBOX_DIRS.length; i++) {
+            skyboxes[i] = new CubeTexture(vkCtx, graphQueue, NPGS_SKYBOX_DIR + SKYBOX_DIRS[i], ".jpg");
+        }
+        // NPGS 原版贴图盘（赤道贴图，iUseImageDisk 门控）
+        diskTexture = new Texture2D(vkCtx, graphQueue, NPGS_SKYBOX_DIR + "Disk/R.jpg");
         // 噪声哈希 LUT（64³ R8，256KB；PerlinNoise 查表路径的哈希表，iNoiseLut 运行时开关）
         noiseHashLut = new NoiseHashLut(vkCtx, graphQueue);
 
-        // 描述符布局：set0 双 UBO；set1 历史(b0)+单层天空盒(b1)+prepass 双纹理(b7/b8)+贴图盘占位(b9)；
+        // 描述符布局：set0 双 UBO；set1 历史(b0)+六套天空盒(b1..b6)+prepass 双纹理(b7/b8)+贴图盘(b9)；
         // Bloom set0 单采样器
-        // （NPGS 的三套变体星空+反宇宙盒裁为一套资源——宇宙变体按 iInWhichUniverse%3 选层，
-        //  本项目配置恒选 0 号层；多天空盒恢复的前置依赖见 kerr_port_plan.md Phase 4 更正）
         argsLayout = new DescSetLayout(vkCtx, new DescSetLayout.LayoutInfo[]{
                 new DescSetLayout.LayoutInfo(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0, 1, VK_SHADER_STAGE_FRAGMENT_BIT),
                 new DescSetLayout.LayoutInfo(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, 1, VK_SHADER_STAGE_FRAGMENT_BIT)});
         texLayout = new DescSetLayout(vkCtx, new DescSetLayout.LayoutInfo[]{
                 new DescSetLayout.LayoutInfo(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, 1, VK_SHADER_STAGE_FRAGMENT_BIT),
+                // b1..b6 = NPGS 六套天空盒（Background0/Antiground0/Background1/Antiground1/
+                //          Background2/Antiground2），与 npgs 冻结原版逐槽位对齐
                 new DescSetLayout.LayoutInfo(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, 1, VK_SHADER_STAGE_FRAGMENT_BIT),
+                new DescSetLayout.LayoutInfo(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2, 1, VK_SHADER_STAGE_FRAGMENT_BIT),
+                new DescSetLayout.LayoutInfo(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3, 1, VK_SHADER_STAGE_FRAGMENT_BIT),
+                new DescSetLayout.LayoutInfo(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4, 1, VK_SHADER_STAGE_FRAGMENT_BIT),
+                new DescSetLayout.LayoutInfo(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 5, 1, VK_SHADER_STAGE_FRAGMENT_BIT),
+                new DescSetLayout.LayoutInfo(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 6, 1, VK_SHADER_STAGE_FRAGMENT_BIT),
                 new DescSetLayout.LayoutInfo(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 7, 1, VK_SHADER_STAGE_FRAGMENT_BIT),
                 new DescSetLayout.LayoutInfo(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8, 1, VK_SHADER_STAGE_FRAGMENT_BIT),
                 new DescSetLayout.LayoutInfo(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 9, 1, VK_SHADER_STAGE_FRAGMENT_BIT),
@@ -244,15 +280,29 @@ public class KerrRender {
             prepassArgsDescSets[i].setBuffer(device, bhArgsPrepassUbo[i], BH_ARGS_SIZE, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
 
             texDescSets[i] = vkCtx.getDescAllocator().addDescSet(device, "kerr-tex-" + i, texLayout);
-            texDescSets[i].setImage(device, dualSkybox.current().getSampler(),
-                    dualSkybox.current().getImageView().getVkImageView(),
-                    1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+            // b1..b6 = 六套 NPGS 天空盒，binding 1+b 对应 SKYBOX_DIRS[b]。
+            // 惰性模式下未载入的槽位先绑到已载入的 0 号盒：Vulkan 要求描述符集内不留未写绑定
+            // （否则验证层报错 / 采样未定义），且当前 iInWhichUniverse 下着色器不会采到它们；
+            // 用户切到其他宇宙变体时由 ensureSkyboxesForUniverse 载入并重绑真纹理。
+            CubeTexture bindSrc = skyboxes[0];
+            for (int b = 0; b < skyboxes.length; b++) {
+                CubeTexture box = skyboxes[b] != null ? skyboxes[b] : bindSrc;
+                texDescSets[i].setImage(device, box.getSampler(),
+                        box.getImageView().getVkImageView(),
+                        1 + b, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+            }
+            // b7/b8 = prepass 双附件（每帧在 render() 内换绑实际视图，此处先绑历史占位保证句柄合法）
+            for (int b = 7; b <= 8; b++) {
+                texDescSets[i].setImage(device, histSampler, histViews[i][0].getVkImageView(), b,
+                        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+            }
+            // b9 = 贴图盘 ImageDiskColor 的 iImageTexture（iUseImageDisk 门控采样）
+            texDescSets[i].setImage(device, diskTexture.getSampler(),
+                    diskTexture.getImageView().getVkImageView(), 9,
+                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
             texDescSets[i].setImage(device, noiseHashLut.getSampler(),
                     noiseHashLut.getImageView().getVkImageView(),
                     10, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
-            // b9 贴图盘占位：绑历史视图（iUseImageDisk=0 恒不采样，仅需合法句柄防 use-after-free）
-            texDescSets[i].setImage(device, histSampler, histViews[i][0].getVkImageView(), 9,
-                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
 
             bloomDescSets[i] = vkCtx.getDescAllocator().addDescSet(device, "kerr-bloom-" + i, bloomTexLayout);
         }
@@ -558,6 +608,16 @@ public class KerrRender {
         if (dualSkybox != null) {
             dualSkybox.cleanup(vkCtx);
         }
+        for (int i = 0; i < skyboxes.length; i++) {
+            if (skyboxes[i] != null) {
+                skyboxes[i].cleanup(vkCtx);
+                skyboxes[i] = null;
+            }
+        }
+        if (diskTexture != null) {
+            diskTexture.cleanup(vkCtx);
+            diskTexture = null;
+        }
         if (noiseHashLut != null) {
             noiseHashLut.cleanup(vkCtx);
             noiseHashLut = null;
@@ -646,6 +706,8 @@ public class KerrRender {
             int writeIdx = 1 - readIdx;
             Device device = vkCtx.getDevice();
             var kp = engCtx.scene().getKerrParams();
+            // 惰性天空盒：用户切换 Universe # / 白洞开关时按需补载对应盒对并重绑描述符
+            ensureSkyboxesForUniverse(vkCtx, kp.universeIndex, kp.whitehole, device);
             // prepass 管线懒建：开关首次打开时现建（vkCreateGraphicsPipelines 是宿主侧
             // 调用，不涉命令缓冲录制，可安全在帧循环内触发）
             if (kp.prepassEnabled) {
@@ -912,6 +974,18 @@ public class KerrRender {
         var geodesic = scene.getGeodesic();
         boolean geodesicActive = geodesic.isActive();
 
+        // 宇宙符号双向交换（与 NpgsRender 同款）：积分子步穿越翻转 / deactivate 复位 → KerrParams；
+        // GUI 手动改值 → 下帧积分。dirty 消费不受 isActive 门控——否则 G 关闭时的复位永远到不了
+        // KerrParams，着色器会带着穿越残留的 -1 在视界外追迹（整屏反宇宙着色）。
+        // kerr.frag 现在会按 iInWhichUniverse / Status 选反宇宙盒（Antiground*），这条链路必须接通。
+        var kpSync = scene.getKerrParams();
+        if (geodesic.isUniverseSignDirty()) {
+            kpSync.universeSign = (float) geodesic.getUniverseSign();
+        }
+        if (geodesicActive) {
+            geodesic.syncUniverseSign(kpSync.universeSign);
+        }
+
         ByteBuffer bh = MemoryUtil.memByteBuffer(bhMapped[slot], BH_ARGS_SIZE);
         camToWorldRot.get(bh);                                    // iInverseCamRot=相机→世界（着色器以此旋转相机系方向到世界）
         bh.position(64);
@@ -950,16 +1024,16 @@ public class KerrRender {
         var kp = scene.getKerrParams();
         float spin = kp.spin;
         bh.putInt(geodesic.isOutgoingPatch() ? 1 : 0)  // iCamDataCoordisOutgoing（CheckAndSwitchCoords 换系后同步）
-          .putInt(0)      // iDEBUG
+          .putInt(kp.debugMode)           // iDEBUG（0..4，3=步数热图）
           .putInt(kp.prepassEnabled ? 2 : 0)  // iPrepass（2=composite 边缘感知合成；0=原路径）
-          .putInt(0)      // iWhitehole
-          .putInt(0)      // iInWhichUniverse
-          .putInt(0)      // iGrid
+          .putInt(kp.whitehole ? 1 : 0)   // iWhitehole（最大延拓：允许穿过虫洞喉道）
+          .putInt(kp.universeIndex)       // iInWhichUniverse（宇宙变体选层 0..2）
+          .putInt(kp.gridMode)            // iGrid（0=关 / 1=GridColor / 2=GridColorSimple）
           .putInt(kp.enableHeatHaze ? 1 : 0)  // iEnableHeatHaze
-          .putInt(0)      // iEnableShadowCulling（NPGS 默认 0）
+          .putInt(kp.shadowCulling ? 1 : 0)   // iEnableShadowCulling（NPGS 默认 0）
           .putInt(geodesicActive ? -1 : 0)      // iObserverMode（-1=外传四维标架；0=静态观者）
-          .putInt(0)      // iPolarization
-          .putInt(0);     // iUseImageDisk
+          .putInt(kp.polarizationMode)          // iPolarization（0=关 / 1=EVPA 色相显示 / 2=马吕斯偏振片）
+          .putInt(kp.useImageDisk ? 1 : 0);     // iUseImageDisk（赤道贴图盘）
         // 37 个 float（顺序同声明）
 
         // 盘时间推进（c·s/Rs）：真实帧间隔 × GUI 倍率；dt 钳制防失焦恢复后跳变，
@@ -973,7 +1047,7 @@ public class KerrRender {
         }
 
         bh.putFloat(kp.quality)                  // iQuality
-          .putFloat(1.0f)                        // iUniverseSign
+          .putFloat(kp.universeSign)             // iUniverseSign（相机所在空间侧 +1/-1，光线宇宙符号种子）
           .putFloat(kp.diskTimeCsRs)             // iBlackHoleTime（c·s/Rs 单位，NPGS: GameTime*c/Rs）
           .putFloat(BH_MASS_SOL)                 // iBlackHoleMassSol
           .putFloat(spin)                        // iSpin ← GUI
@@ -981,11 +1055,11 @@ public class KerrRender {
           .putFloat(kp.mu)                       // iMu（吸积物质比荷,影响盘温标）
           .putFloat(kp.accretionRate)            // iAccretionRate
           .putFloat(kp.backShiftMax)             // iBackShiftMax
-          .putFloat(0.0f)                        // iDensestarsurfaceR
-          .putFloat(4.0f)                        // iDensestarBlackbodyIntensityExponent
-          .putFloat(1.0f)                        // iDensestarRedShiftColorExponent
-          .putFloat(4.0f)                        // iDensestarRedShiftIntensityExponent
-          .putFloat(1.0f)                        // iDensestarBrightmut
+          .putFloat(kp.densestarRadiusRs)        // iDensestarsurfaceR（0=关；致密星表面）
+          .putFloat(kp.densestarBlackbodyExp)    // iDensestarBlackbodyIntensityExponent
+          .putFloat(kp.densestarShiftColorExp)   // iDensestarRedShiftColorExponent
+          .putFloat(kp.densestarShiftBrightExp)  // iDensestarRedShiftIntensityExponent
+          .putFloat(kp.densestarBrightmut)       // iDensestarBrightmut
           .putFloat(KerrParams.iscoInnerRadiusRs(spin, kp.qStar))  // iInterRadiusRs（ISCO(a*,Q*)，随自旋/电荷变化）
           .putFloat(kp.outerRadiusRs)            // iOuterRadiusRs
           .putFloat(kp.thinRs)                   // iThinRs
@@ -997,8 +1071,8 @@ public class KerrRender {
           .putFloat(kp.blackbodyIntensityExponent)  // iBlackbodyIntensityExponent
           .putFloat(kp.redShiftColorExponent)    // iRedShiftColorExponent
           .putFloat(kp.redShiftIntensityExponent)  // iRedShiftIntensityExponent
-          .putFloat(0.0f)                        // iImageRotationSpeed
-          .putFloat(0.0f)                        // iPolarizationAngle
+          .putFloat(kp.imageRotationSpeed)       // iImageRotationSpeed（贴图盘自转角速度）
+          .putFloat(kp.polarizationAngle)        // iPolarizationAngle（偏振片角度）
           .putFloat(kp.heatHaze)                 // iHeatHaze
           .putFloat(kp.backgroundBrightmut)      // iBackgroundBrightmut
           .putFloat(kp.photonRingBoost)          // iPhotonRingBoost
@@ -1012,7 +1086,9 @@ public class KerrRender {
                   : prevViewPerSlot[slot].equals(view) ? 0.06f : 1.0f)  // iBlendWeight（前 2 帧全量覆盖；仅镜头静止时累积，动了即全量重置防拖影）
           .putFloat(kp.noiseLutEnabled ? 1.0f : 0.0f)            // iNoiseLut（扩展字段@384：噪声哈希查表 A/B 开关）
           .putFloat(kp.diskScatter)                              // iDiskScatter（扩展字段@388：盘前向散射强度/背光项，0=关）
-          .putFloat(kp.diskAmbient);                             // iDiskAmbient（扩展字段@392：盘环境光强度/弥散项，0=关）
+          .putFloat(kp.diskAmbient)                              // iDiskAmbient（扩展字段@392：盘环境光强度/弥散项，0=关）
+          .putInt(kp.showFallingDot ? 1 : 0);                    // iShowFallingDot（扩展字段@396：落在 std140 尾部对齐填充内，
+                                                                 //   既有字段偏移不变；NPGS 原版声明更短、自然忽略）
         prevViewPerSlot[slot].set(view);
 
         // ---- prepass UBO：GameArgs 分辨率减半 + iPrepass=1；BlackHoleArgs 字节复制主拷贝后仅改 iPrepass，
@@ -1033,11 +1109,66 @@ public class KerrRender {
         }
     }
 
-    /** [临时调试] 重绑两个插槽 set1.b1 到指定盒 */
+    /**
+     * GUI「山海星空盒」切换时换绑 set1.b1（iBackground0，默认选层）。
+     * <p>
+     * 说明：六套 NPGS 盒在 b1..b6，选层由着色器按 {@code iInWhichUniverse} 取
+     * {@code (iInWhichUniverse+3+useContground)%3}，**绝大多数配置落在 0 号层**
+     * （即 b1）——因此把项目自有的「星空/山海」双盒绑在 b1，仍能在默认选层下生效。
+     * 切到 1/2 号宇宙变体时该开关不参与（那两层始终用 NPGS 原装盒），属已知取舍。
+     */
     private void rebindSkyboxDescSets(Device device, CubeTexture box) {
         for (int i = 0; i < VkUtils.MAX_IN_FLIGHT; i++) {
             texDescSets[i].setImage(device, box.getSampler(), box.getImageView().getVkImageView(),
                     1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+        }
+    }
+
+    /**
+     * 惰性模式下按需补齐当前宇宙变体用到的天空盒对（kerr.lazySkybox）。
+     * <p>
+     * 着色器取盒公式为 {@code (iInWhichUniverse+3+useContground)%3}，故每个宇宙变体
+     * {@code u} 恰好用到两个槽位：{@code 2u}（Background，+1 侧）与 {@code 2u+1}（Antiground，-1 侧）。
+     * 默认 {@code iInWhichUniverse=0} 只用到 U0/A0（init 已载）；用户把 Universe # 切到 1 或 2 时
+     * 在此载入对应那对并重绑 b1..b6，避免一上来就吃满 ~480MB 显存。
+     * <p>
+     * 白洞开启（最大延拓）时，出喉道的光 Status=4/5，{@code useContground=-1} 使取层落到
+     * 「上一个宇宙」{@code (u+2)%3} 那对盒——同样按需补载，否则亮斑采样到 fallback 盒。
+     * <p>
+     * 未载入的槽位始终绑着已载入的盒（见 init 的绑定循环），故描述符集任何时候都不含空句柄。
+     * 已载入的盒**不卸载**（用户来回切换时不反复重传纹理；最坏情况即退化为全量加载）。
+     */
+    private void ensureSkyboxesForUniverse(VkCtx vkCtx, int universeIndex, boolean whitehole, Device device) {
+        if (!lazySkybox || (universeIndex == loadedUniverseIndex && whitehole == loadedWhitehole)) {
+            return;
+        }
+        loadedUniverseIndex = universeIndex;
+        loadedWhitehole = whitehole;
+        int u = Math.max(0, Math.min(SKYBOX_DIRS.length / 2 - 1, universeIndex));
+        int[] bases = whitehole ? new int[]{2 * u, 2 * ((u + 2) % 3)} : new int[]{2 * u};
+        boolean allLoaded = true;
+        for (int base : bases) {
+            if (skyboxes[base] == null || skyboxes[base + 1] == null) allLoaded = false;
+        }
+        if (allLoaded) {
+            return; // 所需盒均已载入过（例如切回来），无需重绑
+        }
+        var graphQueue = new Queue.GraphicsQueue(vkCtx, 0);
+        for (int base : bases) {
+            for (int i = base; i <= base + 1; i++) {
+                if (skyboxes[i] == null) {
+                    skyboxes[i] = new CubeTexture(vkCtx, graphQueue, NPGS_SKYBOX_DIR + SKYBOX_DIRS[i], ".jpg");
+                }
+            }
+        }
+        // 重绑 b1..b6（未载入的仍指向 0 号盒）
+        for (int i = 0; i < VkUtils.MAX_IN_FLIGHT; i++) {
+            for (int b = 0; b < skyboxes.length; b++) {
+                CubeTexture box = skyboxes[b] != null ? skyboxes[b] : skyboxes[0];
+                texDescSets[i].setImage(device, box.getSampler(),
+                        box.getImageView().getVkImageView(),
+                        1 + b, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+            }
         }
     }
 
